@@ -37,6 +37,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.session_unified_radix_cache import (
+    TIER_REF,
+    TIER_UNUSED,
+    SessionUnifiedRadixCacheMixin,
+    _classify_node_tier,
+)
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
@@ -101,6 +107,10 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
+        self.session_ref = 0
+        self.tracked_session_ids: Optional[set] = None
+        self.swa_window_ref = 0
+        self.mamba_frontier_ref = 0
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -182,6 +192,11 @@ class UnifiedLRUList:
         assert node.id in self.cache
         self._remove_node(node)
         self._add_node(node)
+
+    def demote_to_lru(self, node: UnifiedTreeNode):
+        assert node.id in self.cache
+        self._remove_node(node)
+        self._add_node_after(self.tail.lru_prev[self._pt], node)
 
     def reset_node_and_parents_mru(
         self,
@@ -302,7 +317,9 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
-class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
+class UnifiedRadixCache(
+    SessionUnifiedRadixCacheMixin, KVCacheEventMixin, BasePrefixCache
+):
     def __init__(
         self,
         params: CacheInitParams,
@@ -316,6 +333,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.kv_event_queue = []
         self.eviction_policy = params.eviction_policy.lower()
         self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
+        self.enable_session_radix_cache = params.enable_session_radix_cache
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -486,6 +504,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node=self.root_node,
         )
         self._record_all_cleared_event()
+        self._reset_session_radix_state()
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
@@ -770,6 +789,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             skip_swa=getattr(req, "swa_prefix_lock_released", False),
         )
 
+        if is_insert and result is not None and result.last_device_node is not None:
+            req.last_node = result.last_device_node
+
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
@@ -1043,6 +1065,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         child.last_access_time = get_and_increase_time_counter()
 
+        self._session_on_split(new_node, child)
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
         return new_node
@@ -1105,7 +1128,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._touch_node(node)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
-            return InsertResult(prefix_len=0, mamba_exist=True)
+            return InsertResult(prefix_len=0, mamba_exist=True, last_device_node=node)
 
         child_key = key.child_key(self.page_size)
         total_prefix_length = 0
@@ -1171,7 +1194,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node
-        result = InsertResult(prefix_len=total_prefix_length)
+        result = InsertResult(
+            prefix_len=total_prefix_length, last_device_node=target_node
+        )
         for component in self._components_tuple:
             component.commit_insert_component_data(
                 node=target_node,
@@ -1300,6 +1325,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node
+        self._session_forget_node(node)
 
     def _evict_component_and_detach_lru(
         self,
@@ -1441,10 +1467,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
         """Update both device and host leaf sets for a node."""
-        if self._is_device_leaf(node):
+        is_device_leaf = self._is_device_leaf(node)
+        if is_device_leaf:
             self.evictable_device_leaves.add(node)
         else:
             self.evictable_device_leaves.discard(node)
+        if self.enable_session_radix_cache:
+            self._update_session_leaf_tier(node, is_device_leaf)
 
         if self._is_host_leaf(node):
             self.evictable_host_leaves.add(node)
@@ -2748,6 +2777,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             E(
                 f"[Leaf] {len(overlap)} in both sets: {[n.id for n in list(overlap)[:5]]}"
             )
+
+        # Session tier views: disjoint, union == device leaves, memberships match.
+        if self.enable_session_radix_cache:
+            unused = self.unused_evictable_device_leaves
+            referenced = self.referenced_evictable_device_leaves
+            tier_overlap = unused & referenced
+            if tier_overlap:
+                E(f"[Tier] {len(tier_overlap)} in both tier sets")
+            if unused | referenced != self.evictable_device_leaves:
+                E("[Tier] tier union != evictable_device_leaves")
+            for n in unused:
+                if _classify_node_tier(n) != TIER_UNUSED:
+                    E(f"[Tier] node {n.id} in unused but session_ref>0")
+            for n in referenced:
+                if _classify_node_tier(n) != TIER_REF:
+                    E(f"[Tier] node {n.id} in referenced but session_ref==0")
 
         # Stale nodes: leaf sets must only contain tree-reachable nodes
         stale = self.evictable_device_leaves - all_node_set

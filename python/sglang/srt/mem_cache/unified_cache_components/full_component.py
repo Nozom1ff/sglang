@@ -18,6 +18,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.session_unified_radix_cache import (
+    TIER_REF,
+    TIER_UNUSED,
+    _classify_node_tier,
+)
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
@@ -133,42 +138,129 @@ class FullComponent(TreeComponent):
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         request = params.num_tokens
+        cache = self.cache
+        if not cache.enable_session_radix_cache:
+            heap = [
+                (cache.eviction_strategy.get_priority(n), n)
+                for n in cache.evictable_device_leaves
+            ]
+            heapq.heapify(heap)
+            ct = self.component_type
+            while tracker[ct] < request and heap:
+                _, x = heapq.heappop(heap)
+                if x not in cache.evictable_device_leaves:
+                    continue
+                cache._evict_device_leaf(x, tracker)
+                if x.parent is not None and x.parent in cache.evictable_device_leaves:
+                    heapq.heappush(
+                        heap,
+                        (cache.eviction_strategy.get_priority(x.parent), x.parent),
+                    )
+            return
+
+        for leaf_set, tier in (
+            (cache.unused_evictable_device_leaves, TIER_UNUSED),
+            (cache.referenced_evictable_device_leaves, TIER_REF),
+        ):
+            if tracker[self.component_type] >= request:
+                break
+            self._drive_device_tier(leaf_set, tier, request, tracker)
+
+    def _drive_device_tier(
+        self,
+        leaf_set,
+        tier: int,
+        request: int,
+        tracker: dict[ComponentType, int],
+    ) -> None:
+        cache = self.cache
+        ct = self.component_type
         heap = [
-            (self.cache.eviction_strategy.get_priority(n), n)
-            for n in self.cache.evictable_device_leaves
+            ((n.session_ref, cache.eviction_strategy.get_priority(n)), n)
+            for n in leaf_set
         ]
         heapq.heapify(heap)
-        ct = self.component_type
         while tracker[ct] < request and heap:
             _, x = heapq.heappop(heap)
-            if x not in self.cache.evictable_device_leaves:
+            if (
+                x not in cache.evictable_device_leaves
+                or _classify_node_tier(x) != tier
+            ):
                 continue
-            self.cache._evict_device_leaf(x, tracker)
-            if x.parent is not None and x.parent in self.cache.evictable_device_leaves:
+            # write_backup failure makes _evict_device_leaf a no-op; count only
+            # calls that freed device tokens (demote-to-host included).
+            before = tracker[ct]
+            cache._evict_device_leaf(x, tracker)
+            if tier == TIER_REF and tracker[ct] > before:
+                cache.session_ref_evictions[ct] += 1
+            p = x.parent
+            if (
+                p is not None
+                and p in cache.evictable_device_leaves
+                and _classify_node_tier(p) == tier
+            ):
                 heapq.heappush(
                     heap,
-                    (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
+                    ((p.session_ref, cache.eviction_strategy.get_priority(p)), p),
                 )
 
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]
     ) -> None:
         """Evict host leaves to free KV host pool space."""
+        cache = self.cache
+        if not cache.enable_session_radix_cache:
+            heap = [
+                (cache.eviction_strategy.get_priority(n), n)
+                for n in cache.evictable_host_leaves
+            ]
+            heapq.heapify(heap)
+            ct = self.component_type
+            while tracker[ct] < num_tokens and heap:
+                _, x = heapq.heappop(heap)
+                if x not in cache.evictable_host_leaves:
+                    continue
+                cache._evict_host_leaf(x, tracker)
+                if x.parent is not None and x.parent in cache.evictable_host_leaves:
+                    heapq.heappush(
+                        heap,
+                        (cache.eviction_strategy.get_priority(x.parent), x.parent),
+                    )
+            return
+
+        for tier in (TIER_UNUSED, TIER_REF):
+            if tracker[self.component_type] >= num_tokens:
+                break
+            self._drive_host_tier(tier, num_tokens, tracker)
+
+    def _drive_host_tier(
+        self, tier: int, num_tokens: int, tracker: dict[ComponentType, int]
+    ) -> None:
+        cache = self.cache
+        ct = self.component_type
         heap = [
-            (self.cache.eviction_strategy.get_priority(n), n)
-            for n in self.cache.evictable_host_leaves
+            ((n.session_ref, cache.eviction_strategy.get_priority(n)), n)
+            for n in cache.evictable_host_leaves
+            if _classify_node_tier(n) == tier
         ]
         heapq.heapify(heap)
-        ct = self.component_type
         while tracker[ct] < num_tokens and heap:
             _, x = heapq.heappop(heap)
-            if x not in self.cache.evictable_host_leaves:
+            if x not in cache.evictable_host_leaves or _classify_node_tier(x) != tier:
                 continue
-            self.cache._evict_host_leaf(x, tracker)
-            if x.parent is not None and x.parent in self.cache.evictable_host_leaves:
+            before = tracker[ct]
+            cache._evict_host_leaf(x, tracker)
+            if tier == TIER_REF and tracker[ct] > before:
+                cache.session_ref_evictions[ct] += 1
+            p = x.parent
+            if (
+                p is not None
+                and p in cache.evictable_host_leaves
+                and _classify_node_tier(p) == tier
+            ):
                 heapq.heappush(
                     heap,
-                    (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
+                    ((p.session_ref, cache.eviction_strategy.get_priority(p)), p),
                 )
 
     def acquire_component_lock(
@@ -210,6 +302,8 @@ class FullComponent(TreeComponent):
                 delta += key_len
             cd.lock_ref += 1
             self.cache.evictable_device_leaves.discard(cur)
+            if self.cache.enable_session_radix_cache:
+                self.cache._update_session_leaf_tier(cur, False)
             cur = cur.parent
         result.delta = delta
         return result
