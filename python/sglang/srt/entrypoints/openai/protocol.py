@@ -2290,6 +2290,11 @@ class ResponsesResponse(BaseModel):
             if usage.prompt_tokens_details
             else 0
         )
+        reasoning_tokens = (
+            usage.completion_tokens_details.reasoning_tokens
+            if usage.completion_tokens_details
+            else 0
+        )
         return {
             "input_tokens": usage.prompt_tokens,
             "input_tokens_details": {
@@ -2298,7 +2303,7 @@ class ResponsesResponse(BaseModel):
                 "cache_write_tokens": 0,
             },
             "output_tokens": usage.completion_tokens or 0,
-            "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
+            "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
             "total_tokens": usage.total_tokens,
         }
 
