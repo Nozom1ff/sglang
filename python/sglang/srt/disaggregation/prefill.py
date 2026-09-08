@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
+    InvalidDisaggregationMetadata,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -1504,26 +1505,34 @@ class SchedulerDisaggregationPrefillMixin:
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
     ) -> None:
-        computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
-        if last_chunk and computer is not None:
-            if is_health_check_req(req):
-                digest = signature = 0
-            else:
-                if end_idx is None:
-                    end_idx = min(req.extend_end, len(req.origin_input_ids))
-                # Only the pages this prefill sends; decode digests the same
-                # range of its row, past the prefix it promised at bootstrap.
-                start_idx = req.disagg_decode_prefix_len
-                page_indices_gpu = page_indices_for_request(
-                    self, req, end_idx, start_idx=start_idx
-                )
-                state_indices = state_indices_for_request(
-                    self, req, end_idx, start_idx=start_idx
-                )
-                digest = computer.compute(page_indices_gpu, state_indices)
-                signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
-            self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
-        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        try:
+            computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
+            if last_chunk and computer is not None:
+                self.disagg_metadata_buffers._validate_request_metadata(req)
+                if is_health_check_req(req):
+                    digest = signature = 0
+                else:
+                    if end_idx is None:
+                        end_idx = min(req.extend_end, len(req.origin_input_ids))
+                    # Only the pages this prefill sends; decode digests the same
+                    # range of its row, past the prefix it promised at bootstrap.
+                    start_idx = req.disagg_decode_prefix_len
+                    page_indices_gpu = page_indices_for_request(
+                        self, req, end_idx, start_idx=start_idx
+                    )
+                    state_indices = state_indices_for_request(
+                        self, req, end_idx, start_idx=start_idx
+                    )
+                    digest = computer.compute(page_indices_gpu, state_indices)
+                    signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
+                self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
+            self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        except InvalidDisaggregationMetadata as exc:
+            # Keep the request in the inflight queue. Its normal Failed
+            # polling path releases KV and metadata, preserving this 400.
+            prepare_abort(req, str(exc), status_code=HTTPStatus.BAD_REQUEST)
+            req.disagg_kv_sender.abort()
+            self.clear_pending_chunk_send(req)
 
     def _send_kv_chunk(
         self: Scheduler,
