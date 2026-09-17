@@ -350,6 +350,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "cutedsl",
     "flashinfer",
     "flashkda",
+    "cudnn",
     "nvidia_kda",
     "ptx_kda",
     "helion",
@@ -2670,7 +2671,7 @@ class ServerArgs:
     linear_attn_backend: A[
         str,
         Arg(
-            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend. The Helion backend is KDA-only.",
+            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend. The Helion backend is KDA-only. The prefill-only KDA backends (flashkda, cudnn) resolve decode/verify to triton when selected here.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
         NS("exec.mamba"),
@@ -2686,7 +2687,7 @@ class ServerArgs:
     linear_attn_prefill_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer.",
+            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer. The flashkda and cudnn backends are KDA prefill-only (cudnn needs SM100-SM103/SM107 and the safe gate).",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
         NS("exec.mamba"),

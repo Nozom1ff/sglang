@@ -264,6 +264,29 @@ def handle_linear_attn_backend(server_args: Any):
             "(FlashKDA stays on prefill)."
         )
 
+    # cuDNN KDA is prefill-only for the same reason as FlashKDA: the public op
+    # returns a per-sequence final state but has no pool slot indices, no
+    # speculative rollback, and no K3 fused output norm. Same handling —
+    # explicit decode selection is an error, inherited base=cudnn resolves
+    # decode to triton and leaves prefill on cuDNN.
+    if decode == "cudnn":
+        if cfg.linear_attn_decode_backend == "cudnn":
+            raise ValueError(
+                "--linear-attn-decode-backend cudnn is not supported: "
+                "the cuDNN KDA backend is prefill-only. Use "
+                "--linear-attn-prefill-backend cudnn (decode stays on triton)."
+            )
+        declare_resolution(
+            server_args,
+            "_handle_linear_attn_backend",
+            linear_attn_decode_backend="triton",
+        )
+        decode = "triton"
+        logger.info(
+            "The cuDNN KDA backend is prefill-only; using triton for KDA decode "
+            "(cuDNN stays on prefill)."
+        )
+
     if (
         decode == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
@@ -277,6 +300,12 @@ def handle_linear_attn_backend(server_args: Any):
         )
 
     verify = cfg.linear_attn_verify_backend
+    if verify == "cudnn":
+        raise ValueError(
+            "--linear-attn-verify-backend cudnn is not supported: "
+            "the cuDNN KDA backend is prefill-only and the public op has no "
+            "intermediate-state or rollback ports for speculative verify."
+        )
     if verify is None and decode == "flashinfer":
         verify = "flashinfer"
     if (

@@ -169,6 +169,22 @@ class KDAKernelDispatcher:
                     "PTX KDA prefill needs SM103 (GB300); falling back to Triton "
                     "extend."
                 )
+        elif prefill_backend.is_cudnn():
+            if not is_cuda():
+                raise ValueError("KDA cuDNN prefill backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_cudnn import (
+                CuDNNKDAKernel,
+            )
+
+            cudnn_kernel = CuDNNKDAKernel(triton_fallback=triton_kernel)
+            if cudnn_kernel.supports_prefill:
+                self.extend_kernel = cudnn_kernel
+            else:
+                self.extend_kernel = triton_kernel
+                rank0_log(
+                    "KDA cuDNN prefill needs SM100-SM103 or SM107; falling back "
+                    "to Triton extend."
+                )
         elif prefill_backend.is_nvidia_kda():
             if not is_cuda():
                 raise ValueError("NVIDIA KDA prefill backend requires CUDA")
@@ -188,8 +204,8 @@ class KDAKernelDispatcher:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
                 "KDA supports 'triton', 'helion', 'flashkda', 'cutedsl', "
-                "'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
-                "SM100, ptx_kda SM103)."
+                "'cudnn', 'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda "
+                "prefill need SM100, ptx_kda SM103, cudnn SM100-SM103/SM107)."
             )
 
         self.supports_packed_decode = getattr(
