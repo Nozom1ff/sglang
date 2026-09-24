@@ -31,6 +31,8 @@ class TransferKVChunk:
     # Set when the staging worker first counts this chunk toward the per-room
     # outstanding count; stays set across re-enqueue on a watermark defer.
     staging_counted: bool = False
+    # Set while the chunk holds a TransferLifetimeTracker source-buffer lease.
+    lease_held: bool = False
     # Early-send: GPU event to synchronize before reading KV (optional).
     wait_event: Optional[object] = None
     # Must complete before reading asynchronously copied host indices.

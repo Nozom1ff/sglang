@@ -2562,10 +2562,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
         )
-        # Aborted-mid-transfer requests whose KV pages/slot are held until drained
-        # or timed out. Entries:
-        # (decode_req, start_time, deadline, metadata_idx, required_acks).
+        # Aborted-mid-transfer requests whose KV pages/slot are held until all
+        # writers drain. Mooncake and host destinations never release on the
+        # deadline (it only triggers warnings/abort retries); other backends may.
+        # Entries: (decode_req, start_time, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, float, int, int]] = []
+        # A cleanup exception may leave local DMA or partially released state.
+        # Keep administrative/compaction gates closed without retrying a free.
+        self._failed_deferred_releases: List[DecodeRequest] = []
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -2876,7 +2880,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     is_propagated = False
                     failure_reason = "HiCache restore failed"
                     error_message += " (HiCache local restore failed on this rank)"
-                self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
                     logger.debug(error_message)
@@ -2891,12 +2894,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
+                kv_mgr = getattr(decode_req.kv_receiver, "kv_mgr", None)
                 requires_host_drain = self._is_host_destination(decode_req)
-                deferrable = (
+                # Mooncake must always drain a receiver whose destinations were
+                # published; one with none (e.g. a FakeKVReceiver health check)
+                # has nothing in flight and releases at once.
+                requires_transfer_drain = getattr(
+                    kv_mgr, "requires_transfer_drain", False
+                ) and bool(getattr(decode_req.kv_receiver, "bootstrap_infos", None))
+                deferrable = requires_transfer_drain or (
                     self.enable_deferred_kv_release
-                    and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
+                    and getattr(kv_mgr, "enable_deferred_decode_kv_release", False)
                 )
-                if deferrable and not decode_req.kv_receiver.abort_notified:
+                if deferrable:
                     # A failure decode did not initiate (prefill fault, transport
                     # error, hicache restore failure) can still have sibling-rank
                     # writes in flight toward these pages. force_arm: a partial
@@ -2909,6 +2919,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         i,
                         decode_req,
                         requires_host_drain
+                        or requires_transfer_drain
                         or (deferrable and decode_req.kv_receiver.abort_notified),
                     )
                 )
@@ -2963,9 +2974,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         for (i, decode_req, _), hold in zip(failed, held):
             if hold:
+                # _do_release cleans HiCache/HiSparse once writers drain.
                 self._defer_release(decode_req)
                 deferred_indices.add(i)
             else:
+                # Nothing in flight on any rank: no prefill holds destinations.
+                self._clean_hicache_prefetch_resources(decode_req)
                 self._release_request(decode_req)
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
@@ -2994,10 +3008,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return transferred_reqs
 
     def _defer_release(self, decode_req: DecodeRequest) -> None:
+        if any(entry[0] is decode_req for entry in self._deferred_releases):
+            return
         start_time = time.monotonic()
         deadline = start_time + self.deferred_kv_release_timeout
         # Host-capable receivers own their drain tracking. Device destinations
-        # snapshot the number of prefill acknowledgements required by the manager.
+        # snapshot the number of prefill acknowledgements required by the manager
+        # (the receiver may be cleared by resolve time).
         # A rank that only holds for a peer has no local acknowledgements to await.
         required_acks = (
             0
@@ -3019,7 +3036,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         room = decode_req.req.bootstrap_room
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
-        # release pre-allocated kv cache, but don't insert into the tree since it's failed
+        # Deferred from the failure path: a load-back may still target the pages.
+        self._clean_hicache_prefetch_resources(decode_req)
+        # release pre-allocated kv cache (and HiSparse host pages), but don't
+        # insert into the tree since it's failed
         self._release_request(decode_req)
         self.metadata_buffers.clear_slot(idx)
         self.req_to_metadata_buffer_idx_allocator.free(idx)
@@ -3029,7 +3049,33 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.kv_receiver = None
 
     def has_pending_deferred_releases(self) -> bool:
-        return bool(self._deferred_releases)
+        return bool(self._deferred_releases or self._failed_deferred_releases)
+
+    def _local_deferred_release_ready(
+        self, decode_req: DecodeRequest, required_acks: int
+    ) -> bool:
+        """Whether no remote write or local DMA can still touch these pages."""
+        room = decode_req.req.bootstrap_room
+        if self._is_host_destination(decode_req):
+            if not decode_req.kv_receiver.is_abort_release_safe():
+                return False
+        elif not decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
+            room, required_acks
+        ):
+            return False
+        if decode_req.hicache_restore_lock is not None:
+            # An in-flight L2->L1 load-back still writes into these pages.
+            consumer_index = decode_req.hicache_load_consumer_index
+            if consumer_index >= 0 and not self.tree_cache.is_load_back_event_done(
+                consumer_index
+            ):
+                return False
+        if self.enable_staging and self.staging_handler.is_staging_room(room):
+            # Mooncake ACKs follow this room's CHUNK_READY messages on the same
+            # socket. Once all ACKs arrive, its scatter events are registered.
+            if any(not event.query() for event, _ in decode_req._chunk_events):
+                return False
+        return True
 
     def num_pending_deferred_releases(self) -> int:
         return len(self._deferred_releases)
@@ -3044,34 +3090,57 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
 
     def resolve_deferred_releases(self) -> None:
-        """Release drained transfers; device destinations may also time out."""
+        """Release drained transfers in the same order on every Attention TP rank.
+
+        Entries are appended from agreed holds, so every rank reduces the same
+        list in the same order. Mooncake and host destinations never release on
+        timeout; other backends may release device destinations after the deadline.
+        """
         if not self._deferred_releases:
             return
         now = time.monotonic()
         drained = []
         ready = []
-        for decode_req, _, deadline, _, required_acks in self._deferred_releases:
-            if self._is_host_destination(decode_req):
-                # A timeout cannot prove that a remote write has stopped.
-                is_drained = decode_req.kv_receiver.is_abort_release_safe()
-                is_ready = is_drained
-            else:
-                is_drained = decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
-                    decode_req.req.bootstrap_room, required_acks
+        refreshed = []
+        for entry in self._deferred_releases:
+            decode_req, start_time, deadline, idx, required_acks = entry
+            room = decode_req.req.bootstrap_room
+            is_drained = self._local_deferred_release_ready(decode_req, required_acks)
+            # A timeout cannot prove that a remote write has stopped: host
+            # destinations and synchronous Mooncake transfers stay quarantined.
+            requires_transfer_drain = getattr(
+                decode_req.kv_receiver.kv_mgr, "requires_transfer_drain", False
+            )
+            may_time_out = (
+                not self._is_host_destination(decode_req)
+                and not requires_transfer_drain
+            )
+            is_ready = is_drained or (may_time_out and now >= deadline)
+            if not is_ready and requires_transfer_drain and now >= deadline:
+                # Mooncake: re-send the armed ABORT (an earlier one may have
+                # raced sender creation) and keep waiting for the drain ACK.
+                logger.warning(
+                    "Deferred KV release for room %s still lacks a complete "
+                    "transfer drain after %ss; keeping its buffers quarantined.",
+                    room,
+                    self.deferred_kv_release_timeout,
                 )
-                is_ready = is_drained or now >= deadline
+                retry_abort = getattr(decode_req.kv_receiver, "retry_abort", None)
+                if retry_abort is not None:
+                    retry_abort()
+                deadline = now + max(self.deferred_kv_release_timeout, 1.0)
             drained.append(is_drained)
             ready.append(is_ready)
-        # Acks and deadlines are rank-local. Releasing only on some ranks would
-        # diverge admission and the sizes of subsequent polling collectives.
-        # Entries are appended from agreed holds, so every rank reduces the same
-        # list in the same order.
+            refreshed.append((decode_req, start_time, deadline, idx, required_acks))
+        # Acks, local DMA and deadlines are rank-local. Releasing only on some
+        # ranks would diverge admission and the sizes of subsequent polling
+        # collectives.
         ready = all_reduce_flags(
             flags=ready, group=self.gloo_group, op=torch.distributed.ReduceOp.MIN
         )
         still_held = []
         to_release = []
-        for entry, is_ready, is_drained in zip(self._deferred_releases, ready, drained):
+        for entry, is_ready, is_drained in zip(refreshed, ready, drained):
             decode_req, start_time, _, idx, _ = entry
             if is_ready:
                 to_release.append(
@@ -3088,6 +3157,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Commit the survivors before releasing so a _do_release exception can't
         # leave a released entry in the list (double-free / None receiver on retry).
         self._deferred_releases = still_held
+        if not to_release:
+            return
+        cleanup_failed = False
         for decode_req, start_time, idx, room, drained in to_release:
             if not drained:
                 logger.warning(
@@ -3099,22 +3171,41 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             try:
                 self._do_release(decode_req, idx)
             except Exception:
-                # Isolate a failed release so the rest still run; entry already dropped.
+                # Isolate a failed release so the rest still run; entry already
+                # dropped. Its partially freed state stays quarantined locally.
+                cleanup_failed = True
+                self._failed_deferred_releases.append(decode_req)
                 logger.exception(f"Deferred KV release failed for room {room}")
                 outcome = "error"
             self._observe_deferred_kv_release(
                 duration_seconds=max(0.0, now - start_time),
                 outcome=outcome,
             )
+        # Every rank released the same entries, so every rank reaches this
+        # reduction. It is also the post-free barrier: a partially completed
+        # free cannot be rolled back, so stop all ranks before any can admit new
+        # work against a different allocator state.
+        failed_flags = all_reduce_flags(
+            flags=[int(cleanup_failed)],
+            group=self.gloo_group,
+            op=torch.distributed.ReduceOp.MAX,
+        )
+        if failed_flags[0]:
+            raise RuntimeError(
+                "Decode deferred release stopped: an Attention TP peer failed "
+                "buffer cleanup"
+            )
 
     def release_memory_occupation(self):
-        """Clean up in-flight transfers before releasing GPU memory."""
-        self.queue.clear()
-        # Pool is being torn down; drop held entries without per-request release.
-        self._deferred_releases.clear()
+        """Reject offload while any remote transfer can still access the pool."""
+        if self.queue or self.has_pending_deferred_releases():
+            raise RuntimeError(
+                "Cannot release decode memory while KV transfers or quarantined "
+                "transfer buffers are pending."
+            )
 
     def resume_memory_occupation(self):
-        """Queues are already cleared on release; new transfers can be accepted."""
+        """Release requires empty queues, so new transfers can be accepted."""
         pass
 
 

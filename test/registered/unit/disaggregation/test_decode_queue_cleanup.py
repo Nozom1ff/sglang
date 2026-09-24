@@ -13,6 +13,8 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -27,6 +29,18 @@ def _run_as_single_rank(test: unittest.TestCase) -> None:
     world_size = patch("torch.distributed.get_world_size", return_value=1)
     world_size.start()
     test.addCleanup(world_size.stop)
+
+
+class FakeReceiver:
+    def __init__(self):
+        self.clear_called = False
+        self.conclude_state = None
+
+    def clear(self):
+        self.clear_called = True
+
+    def failure_exception(self):
+        return None
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
@@ -100,6 +114,108 @@ class TestDecodeQueueCleanup(CustomTestCase):
         first.kv_receiver.init.assert_called_once_with(1)
         tail.kv_receiver.init.assert_called_once_with(2)
         self.assertEqual(queue.pending_reqs, [])
+
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
+    @patch("sglang.srt.disaggregation.decode.prepare_abort")
+    def test_mooncake_failures_hold_destinations_even_without_optional_flag(
+        self, mock_prepare_abort, mock_release_kv_cache
+    ):
+        # A restore failure folds into the poll only once transport is terminal
+        # (#43562), so Failed is the case that reaches this branch.
+        for poll, restore_status in (
+            (KVPoll.Failed, HiCacheRestoreResult.READY),
+            (KVPoll.Failed, HiCacheRestoreResult.FAILED),
+        ):
+            with self.subTest(poll=poll, restore_status=restore_status):
+                receiver = FakeReceiver()
+                receiver.kv_mgr = SimpleNamespace(
+                    requires_transfer_drain=True,
+                    enable_deferred_decode_kv_release=True,
+                )
+                receiver.bootstrap_infos = [{"rank": 0}, {"rank": 1}]
+                receiver.abort_notified = False
+                receiver.abort = MagicMock()
+
+                def ensure_abort_notified(*, force_arm=False, receiver=receiver):
+                    receiver.abort()
+                    receiver.abort_notified = True
+
+                receiver.ensure_abort_notified = ensure_abort_notified
+                req = SimpleNamespace(
+                    rid="failed-transfer", bootstrap_room=7, return_logprob=False
+                )
+                dreq = SimpleNamespace(
+                    req=req,
+                    kv_receiver=receiver,
+                    metadata_buffer_index=3,
+                    hicache_restore_status=restore_status,
+                )
+                q = DecodeTransferQueue.__new__(DecodeTransferQueue)
+                q.queue = [dreq]
+                q.enable_staging = False
+                q.enable_host_receive = False
+                q.enable_deferred_kv_release = False
+                q.deferred_kv_release_timeout = 30
+                q.gloo_group = MagicMock()
+                q._deferred_releases = []
+                q.tp_rank = 0
+                q._poll_with_metadata_gate = MagicMock(return_value=[poll])
+                q._clean_hicache_prefetch_resources = MagicMock()
+                q.req_to_metadata_buffer_idx_allocator = MagicMock()
+                q.scheduler = MagicMock()
+                q.scheduler.enable_decode_hicache = False
+                q.scheduler.enable_hisparse = True
+                q.scheduler.metrics_reporter.enable_metrics = False
+
+                self.assertEqual(q.pop_transferred(), [])
+                self.assertEqual(q.queue, [])
+                self.assertEqual(len(q._deferred_releases), 1)
+                self.assertEqual(q._deferred_releases[0][3:], (3, 2))
+                self.assertIs(dreq.kv_receiver, receiver)
+                self.assertFalse(receiver.clear_called)
+                q._clean_hicache_prefetch_resources.assert_not_called()
+                q.scheduler.hisparse_coordinator.request_finished.assert_not_called()
+                q.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
+                mock_release_kv_cache.assert_not_called()
+                receiver.abort.assert_called_once()
+
+    def test_retracted_decode_requests_keep_scheduler_non_idle(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.running_batch = MagicMock()
+        scheduler.running_batch.is_empty.return_value = True
+        scheduler.chunked_req = None
+        scheduler._engine_paused = False
+        scheduler.dllm_manager = MagicMock()
+        scheduler.dllm_manager.any_staging_reqs.return_value = False
+        scheduler.last_batch = None
+        scheduler.cur_batch_for_debug = None
+        scheduler.enable_overlap = False
+        scheduler.running_mbs = []
+        scheduler.waiting_queue = []
+        scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[], retracted_queue=[object()]
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], has_pending_deferred_releases=lambda: False
+        )
+        scheduler.decode_offload_manager = None
+        scheduler.enable_hisparse = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_lmcache = False
+
+        self.assertFalse(scheduler.is_fully_idle())
+
+        scheduler.disagg_decode_prealloc_queue.retracted_queue.clear()
+        self.assertTrue(scheduler.is_fully_idle())
+        scheduler.disagg_decode_transfer_queue.has_pending_deferred_releases = lambda: (
+            True
+        )
+        self.assertFalse(scheduler.is_fully_idle())
+        # Quarantined buffers have no GPU forward to carry a health response;
+        # permit a fresh health request while still blocking cache flush/offload.
+        self.assertTrue(scheduler.is_fully_idle(for_health_check=True))
 
 
 class _GateReceiver:
