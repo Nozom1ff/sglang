@@ -2631,6 +2631,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 item_status = (
                     "incomplete"
                     if tool_index in _incomplete_tool_call_indices(tool_parser)
+                    # K3 records a call only after its closing marker arrives.
+                    or (
+                        self.tool_call_parser == "kimi_k3"
+                        and tool_index >= len(tool_parser.detector.prev_tool_call_arr)
+                    )
                     else "completed"
                 )
                 completed_item = ResponseFunctionToolCall(
