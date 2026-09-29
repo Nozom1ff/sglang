@@ -301,7 +301,11 @@ class PtxKDAKernel(LinearAttnKernelBase):
                 g4,
                 b3,
                 scale=head_k_dim**-0.5,
-                initial_state=ssm_states.index_select(0, slot),
+                # The kernel's initial_state contract is fp32; the recurrent
+                # cache's temporal dtype is model-configurable (bf16 for KDA
+                # today). Upcast here -- lossless, and a no-op when already
+                # fp32. The final state is narrowed back below.
+                initial_state=ssm_states.index_select(0, slot).to(torch.float32),
                 output_final_state=True,
                 **cu_kwargs,
                 # SGLang keeps the recurrent state V-major ([slots, H, V, K]);
