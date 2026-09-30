@@ -192,6 +192,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
     build_server_info,
+    configure_logger,
     delete_directory,
     freeze_gc,
     get_bool_env_var,
@@ -252,6 +253,12 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
     server_args: ServerArgs
     port_args: PortArgs
+
+    # uvicorn spawned this worker and configured only its own loggers and this
+    # module's (see _setup_and_run_http_server). Without a root handler, every
+    # other module's INFO was dropped and WARNING+ reached stderr bare through
+    # logging.lastResort.
+    configure_logger(server_args, prefix=f" TokenizerWorker(pid={os.getpid()})")
 
     publish(server_args, role="tokenizer")
 
