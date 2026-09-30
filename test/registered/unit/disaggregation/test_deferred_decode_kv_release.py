@@ -457,6 +457,31 @@ class TestAbortArmsTrackerBeforeSend(CustomTestCase):
         mgr.local_ip, mgr.rank_port = "10.0.0.1", 6000
         return mgr
 
+    def test_tracker_armed_before_the_abort_is_sent(self):
+        mgr = self._make_decode_manager()
+        recv, armed_at_send = self._abort_receiver(mgr, init_time=123.0)
+        recv.ensure_abort_notified()
+        self.assertEqual(armed_at_send, [True])
+
+    def test_prealloc_abort_does_not_arm(self):
+        # A receiver that never published metadata (init_time None) does not
+        # enter the deferred-release flow that cleans the tracker up; arming
+        # it would leak one set per aborted prealloc request.
+        mgr = self._make_decode_manager()
+        recv, armed_at_send = self._abort_receiver(mgr, init_time=None)
+        recv.ensure_abort_notified()
+        self.assertEqual(armed_at_send, [False])
+        self.assertNotIn(500, mgr._deferred_abort_ack_tracker)
+
+    def test_opted_out_backend_does_not_arm(self):
+        # Backends without a drain ack send the ABORT but must not arm:
+        # nothing would ever clean the tracker up.
+        mgr = self._make_decode_manager(enabled=False)
+        recv, armed_at_send = self._abort_receiver(mgr, init_time=123.0)
+        recv.ensure_abort_notified()
+        self.assertEqual(armed_at_send, [False])
+        self.assertNotIn(500, mgr._deferred_abort_ack_tracker)
+
     def test_force_arm_arms_unpublished_receiver_before_send(self):
         # Bug regression: a send_metadata that failed partway leaves init_time
         # None while earlier ranks already hold destinations, so the transfer
