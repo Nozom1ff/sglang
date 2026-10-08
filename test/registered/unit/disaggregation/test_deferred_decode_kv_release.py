@@ -35,6 +35,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreResult
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -1152,8 +1153,20 @@ class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
         self.assertEqual(log, at_failure)
 
 
-class TestBackendOptIn(CustomTestCase):
+class TestBackendCapability(CustomTestCase):
     """Without a prefill ack, every hold waits out the full release timeout."""
+
+    def test_ack_capable_backends_enabled_by_default(self):
+        self.assertTrue(envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get())
+
+    def test_backends_that_ack_opt_in(self):
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+        from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+
+        # Ascend inherits Mooncake's threads, so it opts in too.
+        for cls in (MooncakeKVManager, NixlKVManager):
+            with self.subTest(backend=cls.__name__):
+                self.assertTrue(cls.supports_deferred_decode_kv_release)
 
     def test_backends_without_a_drain_ack_stay_opted_out(self):
         # Inheriting CommonKVManager is not enough: a backend must send the
