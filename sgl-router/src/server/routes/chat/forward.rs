@@ -262,6 +262,18 @@ async fn dispatch<T: Transport>(
     let mut unanswered = ReleaseOnDrop(decode_slot.clone());
     let (response_worker, response_leg, response_load_guards, prefill_task) =
         if let Some((decode, bootstrap)) = pd {
+            let request_id = ["venus-request-id", "x-request-id"]
+                .iter()
+                .find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()))
+                .unwrap_or("-");
+            tracing::info!(
+                request_id,
+                engine_rid = ?engine_rid,
+                prefill_url = %prefill.url,
+                decode_url = %decode.url,
+                bootstrap_room = bootstrap.room,
+                "dispatching paired PD request",
+            );
             let task = spawn_prefill_request(
                 transport.clone(),
                 ctx,
