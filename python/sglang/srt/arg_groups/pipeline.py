@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import get_device_memory_capacity
 
@@ -161,6 +162,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
     from sglang.srt.arg_groups.parallel_hook import (
         handle_context_parallelism,
+        handle_shared_experts_tp,
         handle_data_parallelism,
         handle_dcp_validation,
         handle_dwdp,
@@ -297,12 +299,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
         validate_deepep_v2_speculative_draft,
     )
 
-    handle_moe_kernel_config(server_args)
-    handle_a2a_moe(server_args)
-    handle_eplb_and_dispatch(server_args)
-    handle_expert_distribution_metrics(server_args)
-    handle_elastic_ep(server_args)
-    validate_experimental_sgl_marlin(server_args)
+    run_hook(handle_moe_kernel_config, server_args)
+    run_hook(handle_a2a_moe, server_args)
+    run_hook(handle_shared_experts_tp, server_args)
+    run_hook(handle_eplb_and_dispatch, server_args)
+    run_hook(handle_expert_distribution_metrics, server_args)
+    run_hook(handle_elastic_ep, server_args)
+    run_hook(validate_experimental_sgl_marlin, server_args)
 
     # Handle pipeline parallelism.
     run_post_process_pass(server_args, _pipeline_parallel_overlap_disable)
