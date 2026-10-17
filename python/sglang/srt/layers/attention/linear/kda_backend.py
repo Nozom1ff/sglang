@@ -9,6 +9,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     build_fused_accept_indices,
@@ -17,6 +18,11 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+)
+from sglang.srt.layers.attention.prefill_shared_read import (
+    prefill_snapshot_read_ends,
+    prefill_war_read_done_batch_eligible,
+    prefill_war_read_done_server_eligible,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
@@ -33,7 +39,7 @@ elif is_cpu():
 
     causal_conv1d_update = causal_conv1d_update_cpu
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -402,6 +408,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self._prefill_war_server_ok = prefill_war_read_done_server_eligible(
+            model_runner.token_to_kv_pool
+        )
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
         # conv_states_shape[-1] as the conv window length (kernel_size - 1).
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
@@ -542,6 +551,26 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     self.forward_metadata.mamba_track_mask_indices
                 ]
             )
+
+    def prepare_prefill_shared_read_snapshot(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> None:
+        # Every KDA read of a scheduler-shared buffer (mamba slot mapping,
+        # virtual->physical translation, track slots) happens in
+        # init_forward_metadata; the layers only touch the per-forward
+        # metadata and the mamba state pool, so nothing needs snapshotting.
+        md = self.forward_metadata
+        if md is None:
+            return
+        md.prefill_shared_reads_snapshotted = (
+            self._prefill_war_server_ok
+            and prefill_war_read_done_batch_eligible(forward_batch)
+        )
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        return prefill_snapshot_read_ends(
+            fm, self.forward_metadata, super().shared_read_ends(fm)
+        )
 
     def forward_decode(
         self,

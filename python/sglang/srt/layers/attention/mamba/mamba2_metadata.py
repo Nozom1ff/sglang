@@ -81,6 +81,10 @@ class ForwardMetadata:
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
     conv_states_mask_indices: Optional[torch.Tensor] = None
+    # Set by prepare_prefill_shared_read_snapshot when this EXTEND forward reads
+    # no scheduler-shared buffer past metadata init. Lives on the per-forward
+    # metadata so it cannot leak into the next forward.
+    prefill_shared_reads_snapshotted: bool = False
 
 
 @dataclass(kw_only=True)

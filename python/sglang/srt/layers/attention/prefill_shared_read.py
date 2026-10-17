@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -55,3 +56,22 @@ def prefill_war_read_done_batch_eligible(forward_batch: ForwardBatch) -> bool:
         and not is_cp_active(forward_batch)
         and forward_batch.extend_prefix_lens_cpu is not None
     )
+
+
+def prefill_snapshot_read_ends(
+    fm: ForwardMode, metadata, fallback: SharedReadEnds
+) -> SharedReadEnds:
+    """PRE_REPLAY iff this forward's snapshot hook marked its metadata.
+
+    The graph-context check guards against a metadata object that a graph
+    replay path reuses without calling the hook again.
+    """
+    if (
+        fm == ForwardMode.EXTEND
+        and metadata is not None
+        and getattr(metadata, "prefill_shared_reads_snapshotted", False)
+        and not is_in_breakable_cuda_graph()
+        and not is_in_tc_piecewise_cuda_graph()
+    ):
+        return SharedReadEnds.PRE_REPLAY
+    return fallback
