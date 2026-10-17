@@ -65,6 +65,7 @@ from sglang.srt.layers.dcp.layout import get_dcp_lens, get_dcp_page_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import has_forward_context
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
@@ -837,10 +838,46 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             return
         if any(forward_batch.extend_prefix_lens_cpu):
-            # The first MHA_CHUNKED_KV layer lazily builds the prefix-chunk KV
-            # indices from req_to_token, i.e. after the read-done event.
-            return
+            if not self._snapshot_prefix_chunk_kv_indices(forward_batch):
+                return
         md.prefill_shared_reads_snapshotted = True
+
+    def _snapshot_prefix_chunk_kv_indices(self, forward_batch: ForwardBatch) -> bool:
+        """Build the prefix-chunk KV indices before the read-done event.
+
+        On MHA_CHUNKED_KV the first MLA layer otherwise builds them lazily
+        from req_to_token (forward_mha.forward_normal_chunked_kv_core), after
+        the event. The layer skips its own build once num_prefix_chunks is
+        set, so the arguments must be exactly the ones it would pass.
+        Returns False when the build cannot be done here; the caller then
+        keeps the coarse fence.
+        """
+        if self.disable_chunked_prefix_cache:
+            # Dispatch picks absorbed MLA instead; its KV indices come from the
+            # flashinfer fallback in init_forward_metadata.
+            return True
+        if forward_batch.num_prefix_chunks is not None:
+            return True
+        if not has_forward_context():
+            # prepare_chunked_kv_indices reads req_to_token via the context.
+            return False
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
+            use_dense_prefix_kv,
+            use_fused_prefix_extend,
+            use_packed_prefix_chunks,
+        )
+
+        # The layer resolves the hybrid wrapper to its full-attn child, i.e.
+        # this backend, and calls init_mha_chunk_metadata on the wrapper,
+        # which forwards here as well.
+        forward_batch.prepare_chunked_prefix_cache_info(
+            forward_batch.seq_lens.device,
+            pack_all_prefix_chunks=use_packed_prefix_chunks(self, forward_batch),
+            single_chunk=use_fused_prefix_extend(self, forward_batch),
+            dense_metadata=use_dense_prefix_kv(self),
+        )
+        self.init_mha_chunk_metadata(forward_batch)
+        return True
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return prefill_snapshot_read_ends(
