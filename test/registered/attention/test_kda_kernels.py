@@ -12,6 +12,8 @@ from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
     prepare_chunk_indices_from_lens,
+    prepare_chunk_offsets,
+    prepare_chunk_offsets_from_lens,
 )
 from sglang.kernels.ops.attention.fla.kda import (
     KDA_CHUNK_SIZE,
@@ -412,6 +414,10 @@ class TestKDAHostChunkIndices(CustomTestCase):
                     expected = prepare_chunk_indices(cu_seqlens, chunk_size)
                     actual = prepare_chunk_indices_from_lens(lens, chunk_size)
                     self.assertTrue(torch.equal(actual.to(expected), expected))
+                    expected = prepare_chunk_offsets(cu_seqlens, chunk_size)
+                    actual = prepare_chunk_offsets_from_lens(lens, chunk_size)
+                    self.assertEqual(actual.dtype, expected.dtype)
+                    self.assertTrue(torch.equal(actual, expected))
 
     @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     @torch.inference_mode()
@@ -438,12 +444,13 @@ class TestKDAHostChunkIndices(CustomTestCase):
             dtype=torch.int32,
             device=device,
         )
-        host_table = prepare_chunk_indices_from_lens(lens, KDA_CHUNK_SIZE).to(
-            cu_seqlens
+        host_layout = (
+            prepare_chunk_indices_from_lens(lens, KDA_CHUNK_SIZE).to(cu_seqlens),
+            prepare_chunk_offsets_from_lens(lens, KDA_CHUNK_SIZE).to(device),
         )
 
         outputs, states = [], []
-        for chunk_indices in (None, host_table):
+        for chunk_indices, chunk_offsets in ((None, None), host_layout):
             state = state0.clone()
             outputs.append(
                 chunk_kda(
@@ -460,6 +467,7 @@ class TestKDAHostChunkIndices(CustomTestCase):
                     cu_seqlens=cu_seqlens,
                     A_log=A_log,
                     chunk_indices=chunk_indices,
+                    chunk_offsets=chunk_offsets,
                 )
             )
             states.append(state)

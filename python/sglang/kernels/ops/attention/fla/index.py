@@ -39,10 +39,19 @@ def prepare_chunk_indices_from_lens(
     return _chunk_indices_from_counts([triton.cdiv(n, chunk_size) for n in seq_lens])
 
 
+def prepare_chunk_offsets_from_lens(
+    seq_lens: list[int], chunk_size: int
+) -> torch.LongTensor:
+    """Host-side ``prepare_chunk_offsets`` from per-sequence lengths (CPU)."""
+    num_chunks = torch.tensor([triton.cdiv(n, chunk_size) for n in seq_lens])
+    return torch.cat([num_chunks.new_zeros(1), num_chunks]).cumsum(-1)
+
+
 @tensor_cache
 def prepare_chunk_offsets(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
+    # new_tensor([0]) is a pageable H2D copy, which syncs the stream.
     return torch.cat(
         [cu_seqlens.new_tensor([0]), triton.cdiv(prepare_lens(cu_seqlens), chunk_size)]
     ).cumsum(-1)

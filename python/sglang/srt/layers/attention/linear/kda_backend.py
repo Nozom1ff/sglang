@@ -29,7 +29,10 @@ from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_pin_memory_available
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 if not is_cpu():
-    from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices_from_lens
+    from sglang.kernels.ops.attention.fla.index import (
+        prepare_chunk_indices_from_lens,
+        prepare_chunk_offsets_from_lens,
+    )
     from sglang.kernels.ops.attention.fla.kda import KDA_CHUNK_SIZE
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
@@ -546,12 +549,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             metadata.fused_accept_num_accepted,
         )
 
-    def _host_fla_chunk_indices(
+    def _host_fla_chunk_layout(
         self, forward_batch: ForwardBatch, query_start_loc: Optional[torch.Tensor]
-    ) -> Optional[torch.Tensor]:
-        """The chunked prefill's chunk table for ``query_start_loc``, built from
-        ``extend_seq_lens_cpu``. Without it the Triton kernel reads
-        query_start_loc back once per forward, which blocks the host until the
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """The chunked prefill's chunk table and per-sequence chunk offsets for
+        ``query_start_loc``, built from ``extend_seq_lens_cpu``. Without them
+        the Triton kernel builds both from query_start_loc once per forward (a
+        D2H read-back and a pageable H2D), and each blocks the host until the
         previous forward finishes. Same guard as ``logical_num_tokens``: the
         host lengths must describe exactly the rows of query_start_loc."""
         seq_lens = forward_batch.extend_seq_lens_cpu
@@ -564,19 +568,24 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or len(seq_lens) != forward_batch.batch_size
             or forward_batch.tbo_parent_token_range is not None
         ):
-            return None
+            return None, None
         device = query_start_loc.device
-        table = prepare_chunk_indices_from_lens(seq_lens, KDA_CHUNK_SIZE).to(
-            query_start_loc.dtype
-        )
-        if is_pin_memory_available(device):
-            table = table.pin_memory()
-        return table.to(device, non_blocking=True)
+        pin = is_pin_memory_available(device)
+
+        def upload(t: torch.Tensor) -> torch.Tensor:
+            return (t.pin_memory() if pin else t).to(device, non_blocking=True)
+
+        indices = prepare_chunk_indices_from_lens(seq_lens, KDA_CHUNK_SIZE)
+        offsets = prepare_chunk_offsets_from_lens(seq_lens, KDA_CHUNK_SIZE)
+        # Same dtypes as the device-built versions: indices follow
+        # query_start_loc, offsets are int64 (cumsum promotes).
+        return upload(indices.to(query_start_loc.dtype)), upload(offsets)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
-        self.forward_metadata.fla_chunk_indices = self._host_fla_chunk_indices(
-            forward_batch, self.forward_metadata.query_start_loc
+        md = self.forward_metadata
+        md.fla_chunk_indices, md.fla_chunk_offsets = self._host_fla_chunk_layout(
+            forward_batch, md.query_start_loc
         )
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
@@ -973,9 +982,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             lower_bound=layer.lower_bound,
             beta_is_raw=gate_was_flat,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            # Host-built chunk table for query_start_loc (None -> the Triton
-            # kernel reads query_start_loc back to build it).
+            # Host-built chunk layout for query_start_loc (None -> the Triton
+            # kernel builds it from query_start_loc, syncing the stream).
             chunk_indices=self.forward_metadata.fla_chunk_indices,
+            chunk_offsets=self.forward_metadata.fla_chunk_offsets,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
