@@ -2180,6 +2180,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 and md.extend_num_tokens == q.shape[0] == k.shape[0] == v.shape[0]
             ):
                 lens_cpu = None
+            # Only pass the keywords when set: subclasses (tokenspeed) override
+            # _run_prefill_kernel with the original signature, and never get
+            # host lengths because _ragged_prefill_cpu_seq_lens is off for them.
+            cpu_lens_kwargs = (
+                {"q_seq_lens_cpu": lens_cpu, "kv_seq_lens_cpu": lens_cpu}
+                if lens_cpu is not None
+                else {}
+            )
             return self._run_prefill_kernel(
                 q=q,
                 k=k,
@@ -2195,8 +2203,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=forward_batch.mha_return_lse,
                 out_buffer=out,
                 o_sf_scale=1.0,
-                q_seq_lens_cpu=lens_cpu,
-                kv_seq_lens_cpu=lens_cpu,
+                **cpu_lens_kwargs,
             )
 
 
