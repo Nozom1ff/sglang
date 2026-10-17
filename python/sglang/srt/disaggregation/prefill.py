@@ -786,6 +786,18 @@ class SchedulerDisaggregationPrefillMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
+            # A prefill read-done event lets the WAR barrier above fence only
+            # the result processing behind the forward's shared reads. Re-fence
+            # everything after it (inflight-queue release, the next round's
+            # scheduling and its HiCache transfers) behind the whole forward, as
+            # the coarse barrier did, so none of it can touch state the forward
+            # is still writing. Redundant when the barrier above was coarse.
+            if (
+                self._war_barrier_enabled
+                and envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
+            ):
+                self.schedule_stream.wait_stream(self.forward_stream)
+
             self.process_disagg_prefill_inflight_queue()
 
             # Run sample of the current batch
