@@ -25,8 +25,12 @@ from sglang.srt.layers.attention.prefill_shared_read import (
     prefill_war_read_done_server_eligible,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_pin_memory_available
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
+
+if not is_cpu():
+    from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices_from_lens
+    from sglang.kernels.ops.attention.fla.kda import KDA_CHUNK_SIZE
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
 # Only causal_conv1d_update needs platform-specific overrides for decode.
@@ -542,8 +546,38 @@ class KDAAttnBackend(MambaAttnBackendBase):
             metadata.fused_accept_num_accepted,
         )
 
+    def _host_fla_chunk_indices(
+        self, forward_batch: ForwardBatch, query_start_loc: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """The chunked prefill's chunk table for ``query_start_loc``, built from
+        ``extend_seq_lens_cpu``. Without it the Triton kernel reads
+        query_start_loc back once per forward, which blocks the host until the
+        previous forward finishes. Same guard as ``logical_num_tokens``: the
+        host lengths must describe exactly the rows of query_start_loc."""
+        seq_lens = forward_batch.extend_seq_lens_cpu
+        if (
+            is_cpu()
+            or query_start_loc is None
+            or not forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_target_verify()
+            or seq_lens is None
+            or len(seq_lens) != forward_batch.batch_size
+            or forward_batch.tbo_parent_token_range is not None
+        ):
+            return None
+        device = query_start_loc.device
+        table = prepare_chunk_indices_from_lens(seq_lens, KDA_CHUNK_SIZE).to(
+            query_start_loc.dtype
+        )
+        if is_pin_memory_available(device):
+            table = table.pin_memory()
+        return table.to(device, non_blocking=True)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        self.forward_metadata.fla_chunk_indices = self._host_fla_chunk_indices(
+            forward_batch, self.forward_metadata.query_start_loc
+        )
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
                 self.forward_metadata.mamba_track_mask_indices = (
@@ -939,6 +973,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             lower_bound=layer.lower_bound,
             beta_is_raw=gate_was_flat,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            # Host-built chunk table for query_start_loc (None -> the Triton
+            # kernel reads query_start_loc back to build it).
+            chunk_indices=self.forward_metadata.fla_chunk_indices,
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),

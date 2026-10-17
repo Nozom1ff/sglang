@@ -43,6 +43,10 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 # log2(e) rounded to fp32, matching flash-linear-attention.
 RCP_LN2 = 1.4426950216293335
 
+# Token chunk size of the chunked KDA prefill (chunk_kda_fwd). Host-built
+# chunk_indices passed to chunk_kda must use the same value.
+KDA_CHUNK_SIZE = 64
+
 
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
@@ -1142,15 +1146,15 @@ def chunk_kda_fwd(
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
     beta_is_raw: bool = False,
+    chunk_indices: Optional[torch.LongTensor] = None,
 ):
-    chunk_size = 64
+    chunk_size = KDA_CHUNK_SIZE
     # Pre-compute chunk indices once and thread through all downstream kernels.
     # Without this, each of the 4 callees would recompute independently.
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, chunk_size)
-        if cu_seqlens is not None
-        else None
-    )
+    # Callers that hold the sequence lengths on the host pass them in
+    # (prepare_chunk_indices_from_lens) to skip the cu_seqlens read-back.
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
     if A_log is not None:
         # Fused: gate activation + chunk-local cumsum in one kernel.
@@ -1268,6 +1272,7 @@ def chunk_kda(
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
     beta_is_raw: bool = False,
+    chunk_indices: Optional[torch.LongTensor] = None,
     **kwargs,
 ):
     if scale is None:
@@ -1295,4 +1300,5 @@ def chunk_kda(
         track_state=track_state,
         track_chunk_idx=track_chunk_idx,
         beta_is_raw=beta_is_raw,
+        chunk_indices=chunk_indices,
     )

@@ -9,8 +9,12 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
 from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.kernels.ops.attention.fla.index import (
+    prepare_chunk_indices,
+    prepare_chunk_indices_from_lens,
+)
 from sglang.kernels.ops.attention.fla.kda import (
+    KDA_CHUNK_SIZE,
     chunk_kda,
     fused_recurrent_kda,
     kda_gate_chunk_cumsum,
@@ -381,6 +385,86 @@ class TestKDAChunkExponentDomain(CustomTestCase):
                 state_error = self._relative_rmse(actual_state, expected_state)
                 self.assertLess(output_error, 1e-2, f"output error={output_error:.3%}")
                 self.assertLess(state_error, 1e-2, f"state error={state_error:.3%}")
+
+
+class TestKDAHostChunkIndices(CustomTestCase):
+    """The KDA backend builds the chunk table from host lengths so chunk_kda
+    skips reading cu_seqlens back; it must equal the device-built table."""
+
+    CASES = (
+        [16384],
+        [1],
+        [64],
+        [65],
+        [63, 64, 65, 128, 129],
+        [4096] * 4,
+        # Zero-length rows (padding) must shift the sequence index the same way.
+        [5, 0, 70, 0, 0, 64],
+    )
+
+    def test_matches_cu_seqlens_table(self):
+        for lens in self.CASES:
+            for chunk_size in (16, 64):
+                with self.subTest(lens=lens, chunk_size=chunk_size):
+                    cu_seqlens = torch.tensor(
+                        [0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32
+                    )
+                    expected = prepare_chunk_indices(cu_seqlens, chunk_size)
+                    actual = prepare_chunk_indices_from_lens(lens, chunk_size)
+                    self.assertTrue(torch.equal(actual.to(expected), expected))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+    @torch.inference_mode()
+    def test_chunk_kda_host_table_is_bitwise_equal(self):
+        device = get_device()
+        dtype = torch.bfloat16
+        num_heads, head_dim = 2, 64
+        lens = [15, 64, 65, 200]
+        total_tokens = sum(lens)
+        torch.manual_seed(0)
+        shape = (1, total_tokens, num_heads, head_dim)
+        q = torch.randn(shape, dtype=dtype, device=device)
+        k = torch.randn(shape, dtype=dtype, device=device)
+        v = torch.randn(shape, dtype=dtype, device=device) * 0.1
+        g = (torch.randn(shape, dtype=torch.float32, device=device) - 2.0).to(dtype)
+        beta = torch.rand(1, total_tokens, num_heads, dtype=dtype, device=device)
+        A_log = torch.randn(num_heads, dtype=torch.float32, device=device) * 0.1
+        state0 = (
+            torch.randn(len(lens), num_heads, head_dim, head_dim, device=device)
+            * 0.05
+        )
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(lens).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device=device,
+        )
+        host_table = prepare_chunk_indices_from_lens(lens, KDA_CHUNK_SIZE).to(
+            cu_seqlens
+        )
+
+        outputs, states = [], []
+        for chunk_indices in (None, host_table):
+            state = state0.clone()
+            outputs.append(
+                chunk_kda(
+                    q=q.clone(),
+                    k=k.clone(),
+                    v=v.clone(),
+                    g=g.clone(),
+                    beta=beta.clone(),
+                    initial_state=state,
+                    initial_state_indices=torch.arange(
+                        len(lens), dtype=torch.int32, device=device
+                    ),
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=cu_seqlens,
+                    A_log=A_log,
+                    chunk_indices=chunk_indices,
+                )
+            )
+            states.append(state)
+        self.assertTrue(torch.equal(outputs[0], outputs[1]))
+        self.assertTrue(torch.equal(states[0], states[1]))
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")

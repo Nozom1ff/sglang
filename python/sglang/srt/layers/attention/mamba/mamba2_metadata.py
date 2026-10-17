@@ -30,6 +30,10 @@ class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
     logical_num_tokens: Optional[int] = None
+    # KDA extend: the chunked prefill's (sequence, chunk) table for
+    # query_start_loc, built from host lengths so the kernel does not read
+    # query_start_loc back. None means the kernel builds it from the device.
+    fla_chunk_indices: Optional[torch.Tensor] = None
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
     # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
     # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated
