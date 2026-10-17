@@ -1224,6 +1224,16 @@ class HybridLinearAttnBackend(AttentionBackend):
             b.shared_read_ends(fm) for b in self.attn_backend_list
         )
 
+    def prepare_prefill_shared_read_snapshot(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> None:
+        # Each child decides whether its own reads end pre-replay; the max in
+        # shared_read_ends keeps the wrapper coarse unless every child opts in.
+        for attn_backend in self.attn_backend_list:
+            attn_backend.prepare_prefill_shared_read_snapshot(
+                forward_batch, num_qo_tokens=num_qo_tokens
+            )
+
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
