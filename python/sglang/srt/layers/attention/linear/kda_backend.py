@@ -408,8 +408,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        self._prefill_war_server_ok = prefill_war_read_done_server_eligible(
-            model_runner.token_to_kv_pool
+        self._prefill_war_server_ok = (
+            # Audited for this class only; subclasses (e.g. the Ascend backend)
+            # replace forward_extend and keep the coarse fence.
+            type(self) is KDAAttnBackend
+            and prefill_war_read_done_server_eligible(model_runner.token_to_kv_pool)
         )
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
         # conv_states_shape[-1] as the conv window length (kernel_size - 1).
