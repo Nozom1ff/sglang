@@ -295,7 +295,10 @@ class MambaAttnBackendBase(AttentionBackend):
                     logical_num_tokens = int(query_start_loc[-1])
                 if has_mamba_track_mask:
                     track_conv_indices = self._init_track_conv_indices(
-                        query_start_loc, forward_batch, track_mask_indices
+                        query_start_loc,
+                        forward_batch,
+                        track_mask_indices,
+                        num_tokens=logical_num_tokens,
                     )
 
                     (
@@ -388,9 +391,13 @@ class MambaAttnBackendBase(AttentionBackend):
         query_start_loc: torch.Tensor,
         forward_batch: ForwardBatch,
         track_mask_indices: Optional[torch.Tensor] = None,
+        num_tokens: Optional[int] = None,
     ):
         """Flattened input positions of conv states to track during extend (up to
-        the last complete chunk boundary, mamba_track_mask rows only)."""
+        the last complete chunk boundary, mamba_track_mask rows only).
+
+        ``num_tokens`` is the host-side value of ``query_start_loc[-1]``; with
+        it the final clamp needs no device read."""
         conv_state_len = self.conv_states_shape[-1]
 
         # Shared with the Qwen4-Exp PLE side states so the boundary can never
@@ -413,7 +420,8 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=start_indices.dtype,
         )
 
-        return indices.clamp(0, query_start_loc[-1] - 1)
+        upper = num_tokens - 1 if num_tokens is not None else query_start_loc[-1] - 1
+        return indices.clamp(0, upper)
 
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch

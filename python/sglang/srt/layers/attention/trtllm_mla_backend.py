@@ -88,6 +88,24 @@ from sglang.srt.utils import (
 if is_flashinfer_available():
     import flashinfer
 
+
+def _ragged_prefill_accepts_cpu_seq_lens() -> bool:
+    """Whether the installed flashinfer takes q/kv_seq_lens_cpu. Without them
+    trtllm_ragged_attention_deepseek checks for empty rows with a .item() on
+    device lengths, a host sync per call."""
+    if not is_flashinfer_available():
+        return False
+    import inspect
+
+    try:
+        params = inspect.signature(
+            flashinfer.prefill.trtllm_ragged_attention_deepseek
+        ).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return "q_seq_lens_cpu" in params and "kv_seq_lens_cpu" in params
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -219,6 +237,10 @@ class TRTLLMMLAPrefillMetadata:
     # Set by prepare_prefill_shared_read_snapshot when this EXTEND forward reads
     # no scheduler-shared buffer past metadata init.
     prefill_shared_reads_snapshotted: bool = False
+    # Host copy of the per-request extend lengths (int32, [bs]) for the main
+    # ragged prefill call, where q and kv lengths are both the extend lengths.
+    extend_seq_lens_cpu: Optional[torch.Tensor] = None
+    extend_num_tokens: int = 0
 
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -314,6 +336,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             type(self) is TRTLLMMLABackend
             and isinstance(model_runner.req_to_token_pool, HybridReqToTokenPool)
             and prefill_war_read_done_server_eligible(model_runner.token_to_kv_pool)
+        )
+        # Only the base _run_prefill_kernel calls flashinfer's ragged kernel;
+        # subclasses override it with their own kernels.
+        self._ragged_prefill_cpu_seq_lens = (
+            type(self)._run_prefill_kernel is TRTLLMMLABackend._run_prefill_kernel
+            and _ragged_prefill_accepts_cpu_seq_lens()
         )
 
         # Per-instance shape eligibility: wide-EP DP-attention can push
@@ -1031,6 +1059,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 seq_lens,
                 fallback_to_flashinfer_impl,
             )
+            if self._ragged_prefill_cpu_seq_lens:
+                self.forward_prefill_metadata.extend_seq_lens_cpu = torch.tensor(
+                    forward_batch.extend_seq_lens_cpu, dtype=torch.int32
+                )
+                self.forward_prefill_metadata.extend_num_tokens = sum(
+                    forward_batch.extend_seq_lens_cpu
+                )
 
             if use_varlen_absorbed:
                 # Paged KV spans prefix + extend. seq_lens_cpu is a host tensor, so
@@ -1395,13 +1430,24 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         return_lse: bool,
         out_buffer: torch.Tensor,
         o_sf_scale: float = 1.0,
+        *,
+        q_seq_lens_cpu: Optional[torch.Tensor] = None,
+        kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
         in model-native dtype; subclasses do any kernel-specific quantization.
-        Returns the output tensor or (output, lse) if return_lse."""
+        Returns the output tensor or (output, lse) if return_lse.
+
+        q/kv_seq_lens_cpu, when given, let flashinfer check for empty rows on
+        the host instead of reading device lengths back with .item()."""
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
+        cpu_seq_lens_kwargs = (
+            {"q_seq_lens_cpu": q_seq_lens_cpu, "kv_seq_lens_cpu": kv_seq_lens_cpu}
+            if q_seq_lens_cpu is not None and kv_seq_lens_cpu is not None
+            else {}
+        )
         return flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
             key=k,
@@ -1422,6 +1468,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             o_sf_scale=o_sf_scale,
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+            **cpu_seq_lens_kwargs,
         )
 
     def _set_kv_and_concat_q_fused(
@@ -2123,6 +2170,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=q.device,
                 dtype=self.q_data_type,
             )
+            # q and kv are both this forward's extend tokens, so the same host
+            # lengths describe both. Fall back to the device check whenever
+            # they might not match the tensors (e.g. token padding).
+            md = self.forward_prefill_metadata
+            lens_cpu = md.extend_seq_lens_cpu
+            if lens_cpu is not None and not (
+                lens_cpu.shape[0] == forward_batch.batch_size
+                and md.extend_num_tokens == q.shape[0] == k.shape[0] == v.shape[0]
+            ):
+                lens_cpu = None
             return self._run_prefill_kernel(
                 q=q,
                 k=k,
@@ -2138,6 +2195,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=forward_batch.mha_return_lse,
                 out_buffer=out,
                 o_sf_scale=1.0,
+                q_seq_lens_cpu=lens_cpu,
+                kv_seq_lens_cpu=lens_cpu,
             )
 
 

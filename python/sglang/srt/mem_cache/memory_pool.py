@@ -1008,7 +1008,10 @@ class MambaPool:
             fused_clear_conv_slots(self._conv_slot_desc, indices)
             temporal = self.mamba_cache.temporal
             if temporal.numel() > 0:
-                temporal[:, indices] = 0
+                # index_fill_ takes the 0 as a scalar argument. `t[:, idx] = 0`
+                # first copies a 0 tensor from pageable host memory and syncs,
+                # which blocks the host on the forward stream's backlog.
+                temporal.index_fill_(1, indices.to(torch.int64), 0)
             return
         if not _is_npu:
             need_size = len(indices)
