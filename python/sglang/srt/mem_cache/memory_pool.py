@@ -82,6 +82,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_pin_memory_available,
     is_xpu,
     next_power_of_2,
 )
@@ -1480,10 +1481,18 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
             )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        # Indexing a device tensor with a Python list does a pageable H2D copy
+        # plus a stream sync, which blocks the host behind any WAR fence on the
+        # schedule stream. Stage the rows through pinned memory instead.
+        rows = torch.tensor(
+            select_index,
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(self.device),
+        ).to(self.device, non_blocking=True)
+        self.req_index_to_mamba_index_mapping[rows] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping[rows] = (
                 ping_pong_tensor
             )
         return select_index
