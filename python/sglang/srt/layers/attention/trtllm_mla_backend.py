@@ -46,6 +46,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
@@ -54,9 +55,15 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
     prepare_kv_shard_forward,
 )
+from sglang.srt.layers.attention.prefill_shared_read import (
+    prefill_snapshot_read_ends,
+    prefill_war_read_done_batch_eligible,
+    prefill_war_read_done_server_eligible,
+)
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp.layout import get_dcp_lens, get_dcp_page_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -208,6 +215,9 @@ class TRTLLMMLAPrefillMetadata:
     block_kv_indices: Optional[torch.Tensor] = None
     seq_lens_k: Optional[torch.Tensor] = None
     max_seq_len_k: Optional[int] = None
+    # Set by prepare_prefill_shared_read_snapshot when this EXTEND forward reads
+    # no scheduler-shared buffer past metadata init.
+    prefill_shared_reads_snapshotted: bool = False
 
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -295,6 +305,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self._kv_shard_pool = get_kv_shard_pool(model_runner.token_to_kv_pool)
         self.needs_cpu_seq_lens |= self._kv_shard_pool is not None
+        self._prefill_war_server_ok = (
+            # Audited only as the full-attn child of a hybrid linear model
+            # (Kimi-K3). Subclasses (tokenspeed, cutedsl) add their own prefix
+            # packing / qkv prep, and standalone MLA models were not audited;
+            # both keep the coarse fence.
+            type(self) is TRTLLMMLABackend
+            and isinstance(model_runner.req_to_token_pool, HybridReqToTokenPool)
+            and prefill_war_read_done_server_eligible(model_runner.token_to_kv_pool)
+        )
 
         # Per-instance shape eligibility: wide-EP DP-attention can push
         # num_local_heads out of flashinfer's supported range (e.g. Kimi-K3's
@@ -804,6 +823,29 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             super().init_mha_chunk_metadata(
                 forward_batch, disable_flashinfer_ragged=True
             )
+
+    def prepare_prefill_shared_read_snapshot(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> None:
+        md = self.forward_prefill_metadata
+        if md is None:
+            return
+        md.prefill_shared_reads_snapshotted = False
+        if not (
+            self._prefill_war_server_ok
+            and prefill_war_read_done_batch_eligible(forward_batch)
+        ):
+            return
+        if any(forward_batch.extend_prefix_lens_cpu):
+            # The first MHA_CHUNKED_KV layer lazily builds the prefix-chunk KV
+            # indices from req_to_token, i.e. after the read-done event.
+            return
+        md.prefill_shared_reads_snapshotted = True
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        return prefill_snapshot_read_ends(
+            fm, self.forward_prefill_metadata, super().shared_read_ends(fm)
+        )
 
     def init_forward_metadata_out_graph(
         self,
