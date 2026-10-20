@@ -31,6 +31,8 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
+    get_allocator_from_storage,
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
@@ -118,9 +120,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         layer_shard_enabled: bool = False,
         pool_label: str = "kv",
         host_token_capacity: int | None = None,
+        host_allocator: Optional[HostTensorAllocator] = None,
+        host_buffer_read_only: bool = False,
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
         self.override_kv_cache_dim = override_kv_cache_dim
+        # This rank does not own the MLA host data; the node leader writes it.
+        self.host_buffer_read_only = host_buffer_read_only
         if _is_xpu and not self._is_dummy:
             require_kvcacheio_ops(
                 pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
@@ -235,6 +241,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pool_label=pool_label,
             host_token_capacity=host_token_capacity,
             is_dummy=self._is_dummy,
+            host_allocator=host_allocator,
         )
         if self._is_dummy:
             self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
