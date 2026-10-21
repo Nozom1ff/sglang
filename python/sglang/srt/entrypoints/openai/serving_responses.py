@@ -1591,24 +1591,31 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                 continue
             if tool.type == "function":
-                description, parameters = tool.description, tool.parameters
+                # K3 renders tools with exclude_unset=True. Preserve omitted
+                # fields so equivalent Chat and Responses tools have the same
+                # prompt prefix instead of injecting defaults such as strict=False.
+                function = Function(
+                    **tool.model_dump(
+                        include={"name", "description", "parameters", "strict"},
+                        exclude_unset=True,
+                    )
+                )
             elif tool.type == "custom" and tool.name:
-                description = custom_tool_description(tool.description, tool.format)
-                parameters = custom_tool_parameters()
-            else:
-                continue
-            chat_tools.append(
-                Tool(
-                    type="function",
-                    function=Function(
-                        name=tool.name,
-                        description=description,
-                        parameters=parameters,
-                        strict=tool.strict,
-                        defer_loading=tool.defer_loading if is_muse else None,
+                function = Function(
+                    name=tool.name,
+                    description=custom_tool_description(tool.description, tool.format),
+                    parameters=custom_tool_parameters(),
+                    **(
+                        {"strict": tool.strict}
+                        if "strict" in tool.model_fields_set
+                        else {}
                     ),
                 )
-            )
+            else:
+                continue
+            if is_muse and tool.defer_loading is not None:
+                function.defer_loading = tool.defer_loading
+            chat_tools.append(Tool(type="function", function=function))
         return chat_tools
 
     def _response_tools_to_template_tools(
@@ -2309,6 +2316,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             output=[],
             status="in_progress",
             usage=None,
+            cache_usage=(cache_context or {}).get("usage"),
         ).model_dump()
         initial_response["tools"] = []
         yield _send_event("response.created", response=initial_response)
@@ -2438,6 +2446,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         created_time = created_time or int(time.time())
         sequence_number = 0
+        response_cache_options = None
 
         def _send_event(event):
             nonlocal sequence_number
@@ -2445,6 +2454,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 event.sequence_number = sequence_number
             event_type = getattr(event, "type", "unknown")
             payload = event.model_dump()
+            if isinstance(payload.get("response"), dict):
+                if response_cache_options is not None:
+                    payload["response"]["prompt_cache_options"] = response_cache_options
+                else:
+                    payload["response"].pop("prompt_cache_options", None)
             if isinstance(getattr(event, "item", None), ResponseOutputMessage):
                 payload["item"] = event.item.model_dump()
             if tool_adapter is not None:
@@ -2464,7 +2478,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             output=[],
             status="in_progress",
             usage=None,
+            cache_usage=(cache_context or {}).get("usage"),
         )
+        response_cache_options = initial_response.model_dump().get("prompt_cache_options")
         for event_type in ("response.created", "response.in_progress"):
             yield _send_event(
                 ResponsesLifecycleEvent(type=event_type, response=initial_response)
@@ -3173,6 +3189,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 output=[],
                 status="failed",
                 usage=None,
+                cache_usage=(cache_context or {}).get("usage"),
             )
             failed.error = {"code": "server_error", "message": str(e)}
             yield _send_event(
