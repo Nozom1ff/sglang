@@ -187,6 +187,14 @@ class PrefetchOperation(StorageOperation):
         self.sidecar_hit_pages = 0
         # Cut by the stop policy, not a storage shortfall: the span is still stored.
         self.deadline_expired = False
+        # Observability only, all on the IO / prefetch threads' monotonic clock:
+        # when the existence query finished, when the last KV batch and the
+        # non-KV pool read started, and why the non-KV read was skipped
+        # ("terminated" or "kv_short"; None if it ran).
+        self.query_done_ts: Optional[float] = None
+        self.kv_last_ts: Optional[float] = None
+        self.sidecar_ts: Optional[float] = None
+        self.skip_reason: Optional[str] = None
 
     def mark_terminate(self):
         with self._lock:
@@ -1429,6 +1437,7 @@ class HybridCacheController(BaseHiCacheController):
             kv_hit_pages = len(hash_value)
             operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
             operation.query_pool_hit_pages = {}
+            operation.query_done_ts = time.monotonic()
             return hash_value, kv_hit_pages * self.page_size
 
         extra_info = HiCacheStorageExtraInfo(
@@ -1459,6 +1468,7 @@ class HybridCacheController(BaseHiCacheController):
         for transfer in operation.pool_transfers or ():
             if transfer.name in pool_hits:
                 operation.query_pool_hit_pages[transfer.name] = pool_hits[transfer.name]
+        operation.query_done_ts = time.monotonic()
 
         return (
             hash_value[:kv_hit_pages],
@@ -1496,7 +1506,10 @@ class HybridCacheController(BaseHiCacheController):
         pools = list(PoolName)
         local = operation.query_pool_hit_pages
         packed = torch.tensor(
-            hits + [local.get(pool, _NO_POOL_VERDICT) for pool in pools],
+            hits
+            + [local.get(pool, _NO_POOL_VERDICT) for pool in pools]
+            # [x, -x] under MIN also yields -max x: the cross-rank hit spread.
+            + [-storage_hit_count],
             dtype=torch.int,
         )
         self._all_reduce(
@@ -1507,9 +1520,11 @@ class HybridCacheController(BaseHiCacheController):
         reduced = packed.tolist()
         operation.query_pool_hit_pages = {
             pool: pages
-            for pool, pages in zip(pools, reduced[len(hits) :], strict=True)
+            for pool, pages in zip(pools, reduced[len(hits) : -1], strict=True)
             if pages != _NO_POOL_VERDICT
         }
+        # Cross-rank spread of the raw storage hit (observability only).
+        operation.query_rank_spread = -reduced[-1] - storage_hit_count
         if len(hits) == 1:
             return int(reduced[0])
         restorable = reduced[: len(hits)]
@@ -1622,9 +1637,11 @@ class HybridCacheController(BaseHiCacheController):
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         pool_hits: dict[str, int] = {}
-        if not operation.is_terminated() and kv_completed_pages == len(
-            operation.hash_value
-        ):
+        if operation.is_terminated():
+            operation.skip_reason = "terminated"
+        elif kv_completed_pages != len(operation.hash_value):
+            operation.skip_reason = "kv_short"
+        if operation.skip_reason is None:
             # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
             # Only handle non-KV-derived sidecar pools here.
             transfers_nonkv = [
@@ -1640,6 +1657,7 @@ class HybridCacheController(BaseHiCacheController):
             )
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+            operation.sidecar_ts = time.monotonic()
             try:
                 results = {}
                 for extra_info, transfers in _trailing_chain_groups(
