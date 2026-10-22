@@ -61,6 +61,7 @@ def _hold(q, room, metadata_idx, *, acked=True):
     receiver = SimpleNamespace(
         kv_mgr=mgr,
         abort_notified=True,
+        _abort_generation=generation,
         bootstrap_infos=[{"rank": 0}],
         retry_abort=lambda: None,
     )

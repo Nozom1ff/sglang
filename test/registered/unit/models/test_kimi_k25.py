@@ -630,7 +630,7 @@ class _FakeVideo:
     def __len__(self):
         return len(self.frames)
 
-    def get_frames_as_tensor(self, indices):
+    def get_frames_as_tensor(self, indices, num_threads=None):
         return self.frames[indices]
 
     def close(self):
@@ -955,6 +955,19 @@ def test_kimi_k3_preprocesses_video_chunks_without_a_full_request_concat():
     assert grid_thw.tolist() == [[4, 2, 2], [4, 2, 2]]
 
 
+def _bare_k3_processor():
+    """A KimiK3ImageProcessor without __init__ (which loads the HF processor).
+    Sets the preprocessing knobs __init__ resolves from the environment to its
+    defaults: "auto" mode, no image GPU budget, no video admission limit."""
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor._image_preprocess_mode = "auto"
+    processor._gpu_preprocess_budget_bytes = None
+    processor._log_preprocess_backend = False
+    processor._video_gpu_frame_budget = None
+    processor._video_gpu_queue_depth_limit = None
+    return processor
+
+
 def test_kimi_k3_cpu_prompt_uses_the_same_media_contract():
     actual = _expand_k3_image_prompt_text(
         "before<|media_pad|>between<|media_pad|>after",
@@ -972,7 +985,7 @@ def test_kimi_k3_cpu_prompt_uses_the_same_media_contract():
 
 
 def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.processor_fingerprint = "epd-test-config"
     processor.hf_config = SimpleNamespace(
         vision_config=SimpleNamespace(merge_kernel_size=(2, 2))
@@ -1032,7 +1045,7 @@ def _cached_k3_artifact(content_digest, artifact_key, value=1):
 
 
 def test_kimi_k3_cached_artifact_is_composed_per_prompt():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor._tokenizer = _Tokenizer()
     processor.mm_feature_transport = "cpu"
@@ -1053,7 +1066,7 @@ def test_kimi_k3_cached_artifact_is_composed_per_prompt():
 
 
 def test_kimi_k3_cached_deferred_artifact_has_model_contract():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.mm_feature_transport = "cpu"
     feature = torch.zeros((3, 2, 2), dtype=torch.uint8)
 
@@ -1243,7 +1256,7 @@ def test_kimi_k3_model_accepts_mixed_cached_eager_and_deferred_artifacts():
 
 
 def test_kimi_k3_trusted_hot_hit_skips_media_read():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.processor_fingerprint = "processor"
     processor.trust_mm_content_hashes = True
     processor.mm_preprocess_cache = MultimodalPreprocessCache(1024 * 1024)
@@ -1271,7 +1284,7 @@ def test_kimi_k3_trusted_hot_hit_skips_media_read():
 
 
 def test_kimi_k3_default_media_options_share_one_artifact_key():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.processor_fingerprint = "processor"
     digest = "sha256:" + "ab" * 32
 
@@ -1285,7 +1298,7 @@ def test_kimi_k3_default_media_options_share_one_artifact_key():
 
 
 def test_kimi_k3_output_affecting_media_options_do_not_share_artifacts():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.processor_fingerprint = "processor"
     digest = "sha256:" + "ab" * 32
     base = processor._artifact_key(digest, ImageData(url="image.png"))
@@ -1307,7 +1320,7 @@ def test_kimi_k3_output_affecting_media_options_do_not_share_artifacts():
 
 
 def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.processor_fingerprint = "processor"
     processor.trust_mm_content_hashes = False
     processor.mm_preprocess_cache = MultimodalPreprocessCache(1024 * 1024)
@@ -1334,7 +1347,7 @@ def test_kimi_k3_rejects_changed_feature_hash_for_same_artifact():
 
 
 def test_kimi_k3_artifact_and_data_item_share_hash_resolution():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.mm_feature_transport = "cpu"
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor._tokenizer = _Tokenizer()
@@ -1420,7 +1433,7 @@ def test_kimi_k3_artifact_and_data_item_share_hash_resolution():
 
 
 def test_kimi_k3_untrusted_path_change_is_a_cache_miss():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.processor_fingerprint = "processor"
     processor.trust_mm_content_hashes = False
     processor.mm_preprocess_cache = MultimodalPreprocessCache(1024 * 1024)
@@ -1455,7 +1468,7 @@ def test_kimi_k3_untrusted_path_change_is_a_cache_miss():
 
 
 def test_kimi_k3_partial_hits_deduplicate_misses_and_preserve_order():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.processor_fingerprint = "processor"
     processor.trust_mm_content_hashes = False
     processor.mm_preprocess_cache = MultimodalPreprocessCache(1024 * 1024)
@@ -1511,7 +1524,7 @@ def test_kimi_k3_partial_hits_deduplicate_misses_and_preserve_order():
 
 
 def test_kimi_k3_cancelled_artifact_owner_does_not_fail_joiner():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.processor_fingerprint = "processor"
     processor.trust_mm_content_hashes = False
     processor.mm_preprocess_cache = MultimodalPreprocessCache(1024 * 1024)
@@ -1557,7 +1570,7 @@ def test_kimi_k3_cancelled_artifact_owner_does_not_fail_joiner():
 
 
 def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor.mm_feature_transport = "cpu"
     processor.use_cuda_ipc = False
@@ -1639,7 +1652,7 @@ def test_kimi_k3_cpu_transport_defers_gpu_preprocessing():
 def test_kimi_k3_defers_only_when_raw_transport_is_smaller(
     image_shape, in_patch_limit, expected
 ):
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.mm_feature_transport = "cpu"
     processor._processor = SimpleNamespace(
         preprocess_config=_k3_preprocess_config(in_patch_limit=in_patch_limit),
@@ -1651,7 +1664,7 @@ def test_kimi_k3_defers_only_when_raw_transport_is_smaller(
 
 
 def test_kimi_k3_does_not_defer_non_uint8_tensor_preprocessing():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.mm_feature_transport = "cpu"
 
     with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
@@ -1661,7 +1674,7 @@ def test_kimi_k3_does_not_defer_non_uint8_tensor_preprocessing():
 
 
 def test_kimi_k3_does_not_defer_empty_image_batch():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.mm_feature_transport = "cpu"
 
     with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
@@ -1681,7 +1694,7 @@ def test_kimi_k3_eager_preprocessing_preserves_float_tensor_support():
 
 @pytest.mark.parametrize("transport", ["cuda_ipc", "cuda_vmm"])
 def test_kimi_k3_keeps_gpu_transport_preprocessing_eager(transport):
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.mm_feature_transport = transport
 
     with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True):
@@ -1691,7 +1704,7 @@ def test_kimi_k3_keeps_gpu_transport_preprocessing_eager(transport):
 
 
 def test_kimi_k3_rejects_silently_dropped_images():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.mm_tokens = Mock()
     processor.mm_preprocess_cache = MultimodalPreprocessCache(0)
     processor.load_mm_data = AsyncMock(return_value=SimpleNamespace(images=[object()]))
@@ -1707,7 +1720,7 @@ def test_kimi_k3_rejects_silently_dropped_images():
 
 
 def test_kimi_k3_uses_token_ids_to_preserve_media_boundaries():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.mm_preprocess_cache = MultimodalPreprocessCache(0)
     processor.mm_feature_transport = "cpu"
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
@@ -1736,7 +1749,7 @@ def test_kimi_k3_uses_token_ids_to_preserve_media_boundaries():
 
 
 def test_kimi_k3_loads_mixed_media_and_preserves_source_order():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.mm_feature_transport = "cpu"
     processor.mm_tokens = SimpleNamespace(
         image_token="<|media_pad|>", image_token_id=99
@@ -1791,7 +1804,7 @@ def test_kimi_k3_loads_mixed_media_and_preserves_source_order():
 
 
 def test_kimi_k3_rejects_tokenized_placeholder_mismatch():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor.fast_load_mm_data = AsyncMock()
     processor.load_mm_data = AsyncMock()
@@ -1810,7 +1823,7 @@ def test_kimi_k3_rejects_tokenized_placeholder_mismatch():
 
 
 def test_kimi_k3_rejects_audio_input():
-    processor = object.__new__(KimiK3ImageProcessor)
+    processor = _bare_k3_processor()
     processor.mm_tokens = Mock()
     processor.load_mm_data = AsyncMock()
 
