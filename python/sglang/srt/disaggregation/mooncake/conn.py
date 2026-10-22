@@ -264,7 +264,7 @@ def _uses_flat_entry_layout(
 
 def _transfer_lifetime_of(mgr) -> Optional[TransferLifetimeTracker]:
     """The prefill rank's source-buffer lease tracker; None on decode."""
-    return getattr(mgr, "_transfer_lifetime", None)
+    return mgr._transfer_lifetime
 
 
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
@@ -3519,6 +3519,10 @@ class MooncakeKVSender(CommonKVSender):
 
 class MooncakeKVReceiver(CommonKVReceiver):
     def failure_exception(self):
+        if self._local_failure_reason is not None:
+            # A rejected receiver never owned the room; leave its record alone.
+            self.conclude_state = KVPoll.Failed
+            raise KVTransferError(self.bootstrap_room, self._local_failure_reason)
         # Report failure without retiring transfer bookkeeping: the decode
         # queue calls clear() only after its destination release fence.
         self.conclude_state = KVPoll.Failed

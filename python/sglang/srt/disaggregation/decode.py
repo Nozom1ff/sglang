@@ -3163,7 +3163,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.metadata_buffers.clear_slot(idx)
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         if not self._is_host_destination(decode_req):
-            decode_req.kv_receiver.kv_mgr.clear_deferred_abort_state(room)
+            # Leave a newer receiver's armed state for the reused room alone.
+            decode_req.kv_receiver.kv_mgr.clear_deferred_abort_state(
+                room,
+                generation=decode_req.kv_receiver._abort_generation,
+            )
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
 
@@ -3179,7 +3183,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if not decode_req.kv_receiver.is_abort_release_safe():
                 return False
         elif not decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
-            room, required_acks
+            room,
+            required_acks,
+            # Only this receiver's ACKs prove its writers stopped.
+            generation=decode_req.kv_receiver._abort_generation,
         ):
             return False
         if decode_req.hicache_restore_lock is not None:
