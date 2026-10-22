@@ -1151,8 +1151,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
     @staticmethod
-    def _wants_reasoning_summary(request: ResponsesRequest) -> bool:
-        return request.reasoning is not None and request.reasoning.summary is not None
+    def _wants_reasoning_summary(
+        request: ResponsesRequest, *, default_summary: bool = False
+    ) -> bool:
+        if (
+            request.reasoning is not None
+            and "summary" in request.reasoning.model_fields_set
+        ):
+            return request.reasoning.summary is not None
+        return default_summary
 
     @classmethod
     def _make_reasoning_item(
@@ -1162,11 +1169,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         item_id: str,
         status: Optional[str],
+        default_summary: bool = False,
     ) -> ResponseReasoningItem:
-        """Build a reasoning item, mirroring the trace into ``summary`` when the
-        caller opted in via ``reasoning.summary``; the full trace stays in
-        ``content``."""
-        wants_summary = cls._wants_reasoning_summary(request)
+        """Kimi K3 returns reasoning through ``summary`` by default. Preserve
+        other models' existing ``content`` format and explicit summary opt-in."""
+        wants_summary = cls._wants_reasoning_summary(
+            request, default_summary=default_summary
+        )
         return ResponseReasoningItem(
             id=item_id,
             type="reasoning",
@@ -1175,7 +1184,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if wants_summary
                 else []
             ),
-            content=[ResponseReasoningTextContent(type="reasoning_text", text=text)],
+            content=(
+                None
+                if default_summary and wants_summary
+                else [ResponseReasoningTextContent(type="reasoning_text", text=text)]
+            ),
             encrypted_content=(
                 encode_reasoning_state(text)
                 if request.is_include_encrypted_reasoning()
@@ -1411,6 +1424,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     reasoning_content,
                     item_id=f"rs_{random_uuid()}",
                     status="completed",
+                    default_summary=self.reasoning_parser == "kimi_k3",
                 )
             )
         if content:
@@ -1728,7 +1742,11 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @classmethod
     def _normalize_response_message_for_chat(
-        cls, message: Any, *, tool_call_parser: Optional[str] = None
+        cls,
+        message: Any,
+        *,
+        tool_call_parser: Optional[str] = None,
+        label_developer_instructions: bool = True,
     ) -> Any:
         """Convert one Responses-API input item to a chat-completions message."""
         if hasattr(message, "model_dump"):
@@ -1737,13 +1755,17 @@ class OpenAIServingResponses(OpenAIServingChat):
             return message
 
         # Most chat templates only recognize system/user/assistant/tool; collapse
-        # ``developer`` to ``system`` at the boundary, labelled so the instruction
-        # tier survives the collapse.
+        # ``developer`` to ``system`` at the boundary. K3 already treats both
+        # roles identically; adding a label would change its cached prefix.
         if message.get("role") == "developer":
             message = {
                 **message,
                 "role": "system",
-                "content": label_developer_content(message.get("content")),
+                "content": (
+                    label_developer_content(message.get("content"))
+                    if label_developer_instructions
+                    else message.get("content")
+                ),
             }
 
         msg_type = message.get("type")
@@ -1920,11 +1942,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 }
             )
 
+        is_kimi_k3 = self.chat_encoding_spec == "kimi_k3"
         for input_item in self._response_input_history(request):
             if tool_adapter is not None:
                 input_item = tool_adapter.input_item(input_item)
             normalized = self._normalize_response_message_for_chat(
-                input_item, tool_call_parser=self.tool_call_parser
+                input_item,
+                tool_call_parser=self.tool_call_parser,
+                label_developer_instructions=not is_kimi_k3,
             )
             if normalized is not None:
                 messages.append(normalized)
@@ -1935,7 +1960,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._merge_consecutive_assistant_messages(messages)
 
         # Preserve the history prefix when a later instruction is appended.
-        if self.supports_inline_system:
+        # K3's shared Chat encoder handles system messages in their original
+        # positions. Preserve those positions and content-part boundaries so
+        # equivalent Chat and Responses histories produce identical prefixes.
+        if is_kimi_k3 or self.supports_inline_system:
             return messages
 
         # Most chat templates expect a single leading ``system`` message;
@@ -2591,7 +2619,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
             return item_id
 
-        wants_summary = self._wants_reasoning_summary(request)
+        wants_summary = self._wants_reasoning_summary(
+            request, default_summary=self.reasoning_parser == "kimi_k3"
+        )
 
         def _close_reasoning_item():
             if not reasoning_state["open"]:
@@ -2602,6 +2632,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 text,
                 item_id=reasoning_state["item_id"],
                 status="completed",
+                default_summary=self.reasoning_parser == "kimi_k3",
             )
             events: list = []
             if wants_summary:
@@ -2908,14 +2939,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     id=item_id,
                                     type="reasoning",
                                     summary=[],
-                                    content=[],
+                                    content=(
+                                        None
+                                        if wants_summary
+                                        and self.reasoning_parser == "kimi_k3"
+                                        else []
+                                    ),
                                     status="in_progress",
                                 ),
                             )
                         )
-                        # Clients that opt into ``reasoning.summary`` render
-                        # off the ``reasoning_summary_text.*`` event stream,
-                        # so mirror the trace into a summary part.
+                        # Kimi K3 defaults to the summary event stream. Other
+                        # models opt in through ``reasoning.summary``.
                         if wants_summary:
                             yield _send_event(
                                 openai_responses_types.ResponseReasoningSummaryPartAddedEvent(
