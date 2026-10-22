@@ -1505,11 +1505,13 @@ class HybridCacheController(BaseHiCacheController):
             hits = [storage_hit_count]
         pools = list(PoolName)
         local = operation.query_pool_hit_pages
+        # [x, -x] under MIN also yields -max x: the cross-rank hit spread.
+        # The flag is read once at init, so every rank packs the same shape.
+        spread = [-storage_hit_count] if self.enable_diagnostic_metrics else []
         packed = torch.tensor(
             hits
             + [local.get(pool, _NO_POOL_VERDICT) for pool in pools]
-            # [x, -x] under MIN also yields -max x: the cross-rank hit spread.
-            + [-storage_hit_count],
+            + spread,
             dtype=torch.int,
         )
         self._all_reduce(
@@ -1520,11 +1522,14 @@ class HybridCacheController(BaseHiCacheController):
         reduced = packed.tolist()
         operation.query_pool_hit_pages = {
             pool: pages
-            for pool, pages in zip(pools, reduced[len(hits) : -1], strict=True)
+            for pool, pages in zip(
+                pools, reduced[len(hits) : len(hits) + len(pools)], strict=True
+            )
             if pages != _NO_POOL_VERDICT
         }
-        # Cross-rank spread of the raw storage hit (observability only).
-        operation.query_rank_spread = -reduced[-1] - storage_hit_count
+        if spread:
+            # Cross-rank spread of the raw storage hit (observability only).
+            operation.query_rank_spread = -reduced[-1] - storage_hit_count
         if len(hits) == 1:
             return int(reduced[0])
         restorable = reduced[: len(hits)]
