@@ -349,8 +349,6 @@ class CommonKVManager(BaseKVManager):
     reports_transfer_latency: bool = False
 
     kv_layout: Optional[str] = None
-    # Mooncake retains buffers until transfers drain; other backends do not.
-    requires_transfer_drain = False
     # Prefill-side source-buffer lease tracker; only Mooncake prefill sets it.
     _transfer_lifetime: Optional[TransferLifetimeTracker] = None
     dsv41_spec_layout: Optional[dict] = None

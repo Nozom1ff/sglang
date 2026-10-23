@@ -2520,9 +2520,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def _release_transfer_lease(self, chunk: TransferKVChunk) -> None:
         """Return a chunk's source-buffer lease once all of its I/O has ended."""
-        if chunk.lease_held:
-            chunk.lease_held = False
-            self._transfer_lifetime.release(chunk.room)
+        self._transfer_lifetime.release(chunk.room)
+        chunk.lease_held = False
 
     def _maybe_ack_drained_abort(self, room: int) -> None:
         # Mooncake also gates the ACK on the admission lease: a chunk that is
@@ -2600,10 +2599,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     kv_chunk.room not in self.request_status
                     # Every admitted chunk holds a lease; a closed room means
                     # an ABORT arrived and no new read may start.
-                    or (
-                        kv_chunk.lease_held
-                        and self._transfer_lifetime.is_closed(kv_chunk.room)
-                    )
+                    or self._transfer_lifetime.is_closed(kv_chunk.room)
                     or self.check_status(kv_chunk.room) == KVPoll.Failed
                 ):
                     logger.debug(
@@ -2616,9 +2612,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             thread_finish_flag=True,
                         )
                     self._staging_outstanding.pop(kv_chunk.room, None)
-                    if kv_chunk.lease_held:
-                        # Skipped => nothing written by this chunk; return its lease.
-                        self._release_transfer_lease(kv_chunk)
+                    # Skipped => nothing written by this chunk; return its lease.
+                    self._release_transfer_lease(kv_chunk)
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
@@ -2936,7 +2931,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         "native transport quiescence is unconfirmed",
                         kv_chunk.room,
                     )
-                elif kv_chunk.lease_held:
+                else:
                     self._release_transfer_lease(kv_chunk)
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
@@ -3243,6 +3238,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.transfer_queues[shard_idx].put(chunk)
         except BaseException:
             self._release_transfer_lease(chunk)
+            self._maybe_ack_drained_abort(bootstrap_room)
             raise
 
     def get_session_id(self):
