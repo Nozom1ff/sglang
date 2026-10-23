@@ -594,11 +594,7 @@ if __name__ == "__main__":
         self._cached_abort_socket(sock)
 
         self.assertFalse(old.retry_abort())
-        self.assertFalse(
-            old._send_abort_notification(
-                old.bootstrap_infos, _abort_frames(old, 7), expected_epoch=0
-            )
-        )
+        self.assertFalse(old._send_abort_notification(force_arm=True))
 
         sock.send_multipart.assert_not_called()
         self.assertNotIn(7, mgr._deferred_abort_ack_tracker)
@@ -648,13 +644,7 @@ if __name__ == "__main__":
                 if direct_send:
                     receiver._abort_generation = mgr.register_deferred_abort_room(8)
                 send_attempt = (
-                    (
-                        lambda: receiver._send_abort_notification(
-                            receiver.bootstrap_infos,
-                            _abort_frames(receiver, 8),
-                            expected_epoch=mgr._parallel_info_epochs.get(ADDR, 0),
-                        )
-                    )
+                    (lambda: receiver._send_abort_notification(force_arm=True))
                     if direct_send
                     else receiver.retry_abort
                 )
@@ -1048,9 +1038,7 @@ if __name__ == "__main__":
 
         receiver.ensure_abort_notified(force_arm=True)
         receiver.retry_abort()
-        receiver._send_abort_notification(
-            receiver.bootstrap_infos, _abort_frames(receiver, 7)
-        )
+        receiver._send_abort_notification(force_arm=True)
 
         self.assertFalse(receiver.abort_notified)
         receiver.kv_mgr.register_deferred_abort_room.assert_not_called()
