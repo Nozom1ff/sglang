@@ -302,6 +302,9 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.unified_cache.storage_attachment import (
+    validate_runtime_storage_update,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -5455,6 +5458,11 @@ class Scheduler(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
+        try:
+            validate_runtime_storage_update()
+        except ValueError as e:
+            return AttachHiCacheStorageReqOutput(success=False, message=str(e))
+
         if not self.is_fully_idle():
             return AttachHiCacheStorageReqOutput(
                 success=False,
@@ -5510,6 +5518,11 @@ class Scheduler(
             return DetachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )
+
+        try:
+            validate_runtime_storage_update()
+        except ValueError as e:
+            return DetachHiCacheStorageReqOutput(success=False, message=str(e))
 
         if not self.is_fully_idle():
             return DetachHiCacheStorageReqOutput(
