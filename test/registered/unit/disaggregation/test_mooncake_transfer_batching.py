@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
+from sglang.srt.disaggregation.common.transfer_lifetime import TransferLifetimeTracker
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -450,12 +451,15 @@ class TestMooncakeEarlySend(CustomTestCase):
     def test_manager_preserves_event_in_queued_chunk(self):
         queue = SimpleQueue()
         ready = MagicMock()
+        lifetime = TransferLifetimeTracker()
+        lifetime.open(1)  # the room's sender exists
         manager = SimpleNamespace(
             disaggregation_mode=DisaggregationMode.PREFILL,
             request_status={1: KVPoll.WaitingForInput},
             check_status=lambda room: KVPoll.WaitingForInput,
             transfer_infos={1: {"127.0.0.1:80": object()}},
             transfer_queues=[queue],
+            _transfer_lifetime=lifetime,
         )
         indices_ready = MagicMock()
         MooncakeKVManager.add_transfer_request(
@@ -470,6 +474,7 @@ class TestMooncakeEarlySend(CustomTestCase):
         chunk = queue.get_nowait()
         self.assertIs(chunk.wait_event, ready)
         self.assertIs(chunk.indices_event, indices_ready)
+        self.assertTrue(chunk.lease_held)
         ready.synchronize.assert_not_called()
         indices_ready.synchronize.assert_not_called()
 
