@@ -603,6 +603,7 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.deferred_bootstrap = None
         manager.enable_staging = False
         manager._transfer_lifetime = TransferLifetimeTracker()
+        manager._abort_drain_lock = threading.RLock()
         sender = object.__new__(MooncakeKVSender)
         sender.kv_mgr, sender.bootstrap_room = manager, 42
         sender.conclude_state = None
