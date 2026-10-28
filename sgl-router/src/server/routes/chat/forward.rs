@@ -225,7 +225,9 @@ async fn dispatch<T: Transport>(
         (decode, bootstrap)
     });
     let path = request.path;
-    let engine_rid = request.engine_rid();
+    let engine_rid = request.engine_rid(pd.is_some());
+    // Read before `outgoing_body`, which consumes the cached parse.
+    let caller_rid = pd.as_ref().and_then(|_| request.caller_rid());
     let additions = Additions {
         rid: engine_rid.clone(),
         bootstrap: pd.as_ref().map(|(_, bootstrap)| DisaggregatedParams {
@@ -269,6 +271,7 @@ async fn dispatch<T: Transport>(
             tracing::info!(
                 request_id,
                 engine_rid = ?engine_rid,
+                caller_rid = ?caller_rid,
                 prefill_url = %prefill.url,
                 decode_url = %decode.url,
                 bootstrap_room = bootstrap.room,
