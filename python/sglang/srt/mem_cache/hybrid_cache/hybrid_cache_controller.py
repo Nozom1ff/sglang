@@ -27,6 +27,10 @@ from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.hicache_draft_node_merge import (
+    DraftNodeMerge,
+    DraftNodeShareAllocator,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
@@ -227,6 +231,8 @@ class HybridCacheController(BaseHiCacheController):
             and anchor_host_pool.host_buffer_read_only
         )
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
+        # Set when the DRAFT sidecar registers a node-shared host pool.
+        self.draft_node_merge: Optional[DraftNodeMerge] = None
         self.pp_prefetch_command_group = None
         self.pp_prefetch_command_thread = None
         self.pp_prefetch_command_queue: Queue[Optional[PPPrefetchTicket]] = Queue()
@@ -354,6 +360,10 @@ class HybridCacheController(BaseHiCacheController):
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
         self.mem_pool_host.add_entry(entry)
+        if entry.name == PoolName.DRAFT and isinstance(
+            entry.host_pool.allocator, DraftNodeShareAllocator
+        ):
+            self.draft_node_merge = entry.host_pool.allocator.merge
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
         if self.enable_storage and self.storage_backend is not None:
@@ -1445,6 +1455,9 @@ class HybridCacheController(BaseHiCacheController):
             )
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
+        # Checked before backup_skip: TP0 writes MLA but not a merged draft.
+        if transfer.name == PoolName.DRAFT and self.draft_node_merge is not None:
+            return self.draft_node_merge.is_leader
         if not self.backup_skip:
             return True
 

@@ -8,7 +8,8 @@ NUMA placement and binding are deployment responsibilities.
 
 Followers keep only dummy slot metadata; the leader restores MLA layers and the
 forward layer-wait hook broadcasts them over NCCL. Only the leader does MLA D2H,
-L3 reads and Mooncake registration; KDA/Mamba stays per rank.
+L3 reads and Mooncake registration; KDA/Mamba stays per rank. An MHA draft
+sidecar can share a node buffer too (see hicache_draft_node_merge.py).
 
 Requires MADV_POPULATE_WRITE (Linux 5.14+). Launch validation rejects Mooncake
 standalone_storage, PD decode and DCP.

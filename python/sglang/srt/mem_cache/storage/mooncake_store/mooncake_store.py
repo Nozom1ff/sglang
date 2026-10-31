@@ -664,6 +664,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self._storage_hit_limited = {}
             # Set at registration and resent on every flush (a gauge).
             self._host_pool_bytes = {}
+            # Set when the DRAFT pool is a node share (hicache_draft_node_merge).
+            self.draft_node_merge = None
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -773,7 +775,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self._record_host_pool_bytes(str(host_pool_name), host_pool)
         if host_pool_name == PoolName.DRAFT:
             self.registered_pools[host_pool_name] = host_pool
-            super().register_buffer(host_pool.kv_buffer)
+            self.draft_node_merge = self._resolve_draft_node_merge(host_pool)
+            if self.draft_node_merge is None:
+                super().register_buffer(host_pool.kv_buffer)
+            elif self.draft_node_merge.is_leader:
+                # The leader scatter-gathers every rank's slice of the node.
+                super().register_buffer(host_pool.allocator.node_buffer)
             return
 
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
@@ -840,7 +847,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # tag is what keeps these keys from colliding with target's
             # `{rank}_k` / `{rank}_k` + `{rank}_v` keys.
             draft_pool = self.registered_pools.get(PoolName.DRAFT)
-            if isinstance(draft_pool, MLATokenToKVPoolHost):
+            if self.draft_node_merge is not None:
+                # One object per node: every rank's K and V for the page.
+                suffixes = [f"_{PoolName.DRAFT}_{self.draft_node_merge.key_suffix}"]
+            elif isinstance(draft_pool, MLATokenToKVPoolHost):
                 suffixes = [f"_{self.mla_suffix}_{PoolName.DRAFT}_k"]
             else:
                 suffixes = [
@@ -976,10 +986,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             page_keys, transfer
         )
         keys = self._tag_keys(component_keys)
+        merge = self.draft_node_merge if transfer.name == PoolName.DRAFT else None
+        if merge is not None and not merge.is_leader:
+            return _ObjectLayout(
+                keys=keys, objects_per_page=objects_per_page, skip_io=True
+            )
         if host_indices is None:
             return _ObjectLayout(keys=keys, objects_per_page=objects_per_page)
         host_pool = self.registered_pools[transfer.name]
-        ptr_list, size_list = host_pool.get_page_buffer_meta(host_indices)
+        if merge is not None:
+            from sglang.srt.mem_cache.hicache_draft_node_merge import (
+                node_page_buffer_meta,
+            )
+
+            ptr_list, size_list = node_page_buffer_meta(host_pool, merge, host_indices)
+        else:
+            ptr_list, size_list = host_pool.get_page_buffer_meta(host_indices)
         ptr_list, size_list = self._pack_multi_buffer_meta(keys, ptr_list, size_list)
         return _ObjectLayout(
             keys=keys,
@@ -1644,3 +1666,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else "rank"
         )
         self._host_pool_bytes[(pool, sharing)] = nbytes
+
+    @staticmethod
+    def _resolve_draft_node_merge(host_pool: Any):
+        if not isinstance(host_pool, HostKVCache):
+            return None
+        # Lazy: the node-leader module pulls in distributed state.
+        from sglang.srt.mem_cache.hicache_draft_node_merge import (
+            DraftNodeShareAllocator,
+        )
+
+        if not isinstance(host_pool.allocator, DraftNodeShareAllocator):
+            return None
+        return host_pool.allocator.merge
