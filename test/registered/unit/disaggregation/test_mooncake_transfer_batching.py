@@ -1,7 +1,6 @@
 import concurrent.futures
 import ctypes
 import unittest
-from collections import defaultdict
 from queue import SimpleQueue
 from threading import Event, Lock
 from types import SimpleNamespace
@@ -502,7 +501,6 @@ class TestMooncakeEarlySend(CustomTestCase):
             enable_trace=False,
             enable_staging=False,
             enable_deferred_decode_kv_release=True,
-            _staging_outstanding=defaultdict(int),
             request_status={1: KVPoll.WaitingForInput},
             transfer_infos={1: {"peer": peer}},
             _prefill_unique_rank=lambda: 0,
@@ -521,6 +519,13 @@ class TestMooncakeEarlySend(CustomTestCase):
             bootstrap_port=8998,
         )
         manager.check_status = lambda room: manager.request_status[room]
+        # add_transfer_request holds one lease per queued chunk.
+        manager._transfer_lifetime = TransferLifetimeTracker()
+        manager._transfer_lifetime.open(1)
+        manager._transfer_lifetime.try_acquire(1)
+        manager._complete_transfer_chunk = lambda chunk: (
+            MooncakeKVManager._complete_transfer_chunk(manager, chunk)
+        )
         return manager, queue
 
     def test_worker_waits_before_reading_kv(self):
@@ -567,7 +572,7 @@ class TestMooncakeEarlySend(CustomTestCase):
         ready.synchronize.assert_called_once_with()
         manager.send_kvcache.assert_not_called()
         manager._maybe_ack_drained_abort.assert_called_once_with(1)
-        self.assertNotIn(1, manager._staging_outstanding)
+        self.assertTrue(manager._transfer_lifetime.is_drained(1))
 
     def test_failed_room_skips_wait(self):
         ready = MagicMock()
@@ -577,7 +582,7 @@ class TestMooncakeEarlySend(CustomTestCase):
         ready.synchronize.assert_not_called()
         manager.send_kvcache.assert_not_called()
         manager._maybe_ack_drained_abort.assert_called_once_with(1)
-        self.assertNotIn(1, manager._staging_outstanding)
+        self.assertTrue(manager._transfer_lifetime.is_drained(1))
 
     def test_worker_preserves_no_event_path(self):
         manager, queue = self._worker(None)
