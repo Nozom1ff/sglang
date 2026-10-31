@@ -1088,14 +1088,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             [layout.buffer_sizes[i] for i in missing_idx],
             self._filter_group_ids(group_ids, missing_idx),
         )
-        self._record_io(
-            pool,
-            "put",
-            objects=len(missing_idx),
-            pages=len({i // per_page for i in missing_idx}),
-            nbytes=sum(_object_nbytes(layout.buffer_sizes[i]) for i in missing_idx),
-            seconds=time.perf_counter() - start,
-        )
+        if self.enable_storage_metrics:
+            self._record_io(
+                pool,
+                "put",
+                objects=len(missing_idx),
+                pages=len({i // per_page for i in missing_idx}),
+                nbytes=sum(
+                    _object_nbytes(layout.buffer_sizes[i]) for i in missing_idx
+                ),
+                seconds=time.perf_counter() - start,
+            )
         for i, res in zip(missing_idx, put_results):
             io_results[i] = res
         return io_results
@@ -1107,14 +1110,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         io_results = self._get_batch_zero_copy_impl(
             layout.keys, layout.buffer_ptrs, layout.buffer_sizes, pool=pool
         )
-        self._record_io(
-            pool,
-            "get",
-            objects=len(layout.keys),
-            pages=num_pages,
-            nbytes=sum(res for res in io_results if res > 0),
-            seconds=time.perf_counter() - start,
-        )
+        if self.enable_storage_metrics:
+            self._record_io(
+                pool,
+                "get",
+                objects=len(layout.keys),
+                pages=num_pages,
+                nbytes=sum(res for res in io_results if res > 0),
+                seconds=time.perf_counter() - start,
+            )
         return io_results
 
     def batch_get_v2(
@@ -1254,16 +1258,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             key_strs, buffer_ptrs, buffer_sizes
         )
         end_time = time.perf_counter()
-        self._record_io(
-            str(PoolName.KV),
-            "get",
-            objects=len(key_strs),
-            pages=len(keys),
-            nbytes=sum(res for res in get_results if res > 0),
-            seconds=end_time - start_time,
-        )
 
         if self.enable_storage_metrics:
+            self._record_io(
+                str(PoolName.KV),
+                "get",
+                objects=len(key_strs),
+                pages=len(keys),
+                nbytes=sum(res for res in get_results if res > 0),
+                seconds=end_time - start_time,
+            )
             self.prefetch_pgs.append(len(keys))
             self.prefetch_bandwidth.append(
                 len(keys) / (end_time - start_time) * self.gb_per_page
@@ -1320,16 +1324,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self._filter_group_ids(group_ids, set_indices),
             )
             end_time = time.perf_counter()
-            self._record_io(
-                str(PoolName.KV),
-                "put",
-                objects=len(set_keys),
-                pages=len({i // key_multiplier for i in set_indices}),
-                nbytes=sum(_object_nbytes(size) for size in set_buffer_sizes),
-                seconds=end_time - start_time,
-            )
 
             if self.enable_storage_metrics:
+                self._record_io(
+                    str(PoolName.KV),
+                    "put",
+                    objects=len(set_keys),
+                    pages=len({i // key_multiplier for i in set_indices}),
+                    nbytes=sum(_object_nbytes(size) for size in set_buffer_sizes),
+                    seconds=end_time - start_time,
+                )
                 self.backup_pgs.append(len(set_keys))
                 self.backup_bandwidth.append(
                     len(set_keys) / (end_time - start_time) * self.gb_per_page
