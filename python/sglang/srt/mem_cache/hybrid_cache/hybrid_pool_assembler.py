@@ -1187,11 +1187,7 @@ def build_hybrid_mamba_stack(
             capacity_multiplier=(
                 1 if node_leader is None else node_leader.capacity_multiplier
             ),
-            is_dummy=(
-                node_leader is not None
-                and node_leader.is_follower
-                and node_leader.broadcast is not None
-            ),
+            is_dummy=node_leader is not None and node_leader.is_follower,
             host_allocator=None
             if node_leader is None
             else node_leader.shared_allocator,

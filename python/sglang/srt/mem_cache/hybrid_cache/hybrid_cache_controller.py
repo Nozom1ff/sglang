@@ -727,7 +727,7 @@ class HybridCacheController(BaseHiCacheController):
         anchor = self.mem_pool_host.anchor_entry
         transfers = []
         # Node-leader MLA followers skip the anchor on D2H (read-only host copy)
-        # and, in broadcast mode, on H2D (KV comes from the leader's broadcast).
+        # and on H2D (KV comes from the leader's broadcast).
         if host_indices.numel() > 0 and include_anchor:
             transfers.append(
                 L2Transfer(
