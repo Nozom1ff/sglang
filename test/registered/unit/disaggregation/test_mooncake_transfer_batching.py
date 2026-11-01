@@ -459,6 +459,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             transfer_infos={1: {"127.0.0.1:80": object()}},
             transfer_queues=[queue],
             _transfer_lifetime=lifetime,
+            _draft_peer_gather=None,
         )
         indices_ready = MagicMock()
         MooncakeKVManager.add_transfer_request(
