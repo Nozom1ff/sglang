@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
+import msgspec
 import requests
 import torch
 
@@ -37,6 +38,24 @@ SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
 
 logger = logging.getLogger(__name__)
+
+
+class _ObjectLayout(msgspec.Struct, frozen=True):
+    """How one PoolTransfer's pages map onto Mooncake objects."""
+
+    # Tagged object keys, page-major: page i owns keys[i * objects_per_page:].
+    keys: List[str]
+    objects_per_page: int
+    # Zipped with keys; an entry is a list when one object spans several
+    # host segments. None for existence-only layouts.
+    buffer_ptrs: Optional[List[Any]] = None
+    buffer_sizes: Optional[List[Any]] = None
+    # This rank does no L3 IO for the pool; report every page present and done.
+    skip_io: bool = False
+
+
+def _object_nbytes(size: Any) -> int:
+    return sum(size) if isinstance(size, Sequence) else size
 
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
@@ -682,6 +701,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self._read_failed_keys = {}
             self._read_failed_keys_lock = threading.Lock()
             self._read_codes_logged = set()
+            # Backup and prefetch threads both record; drained by get_stats().
+            self._io_stats_lock = threading.Lock()
+            self._storage_io = {}
+            self._storage_io_durations = []
+            self._storage_hit_limited = {}
+            # Set at registration and resent on every flush (a gauge).
+            self._host_pool_bytes = {}
+            # Set when the DRAFT pool is a node share (hicache_draft_node_merge).
+            self.draft_node_merge = None
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -762,6 +790,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        self._record_host_pool_bytes(str(PoolName.KV), mem_pool_host)
         if getattr(self.mem_pool_host, "kv_buffer", None) is None:
             # Hybrid logical anchors only own allocation indices. Their physical
             # tensors are registered through register_mem_host_pool_v2().
@@ -787,9 +816,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
             return
+        self._record_host_pool_bytes(str(host_pool_name), host_pool)
         if host_pool_name == PoolName.DRAFT:
             self.registered_pools[host_pool_name] = host_pool
-            super().register_buffer(host_pool.kv_buffer)
+            self.draft_node_merge = self._resolve_draft_node_merge(host_pool)
+            if self.draft_node_merge is None:
+                super().register_buffer(host_pool.kv_buffer)
+            elif self.draft_node_merge.is_leader:
+                # The leader scatter-gathers every rank's slice of the node.
+                super().register_buffer(host_pool.allocator.node_buffer)
             return
 
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
@@ -980,7 +1015,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # tag is what keeps these keys from colliding with target's
             # `{rank}_k` / `{rank}_k` + `{rank}_v` keys.
             draft_pool = self.registered_pools.get(PoolName.DRAFT)
-            if isinstance(draft_pool, MLATokenToKVPoolHost):
+            if self.draft_node_merge is not None:
+                # One object per node: every rank's K and V for the page.
+                suffixes = [f"_{PoolName.DRAFT}_{self.draft_node_merge.key_suffix}"]
+            elif isinstance(draft_pool, MLATokenToKVPoolHost):
                 suffixes = [f"_{self.mla_suffix}_{PoolName.DRAFT}_k"]
             else:
                 suffixes = [
@@ -1067,32 +1105,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if not restorable:
             return PoolTransferResult(0, hit_count, [])
 
-        prepared = []
-        all_component_keys = []
-        for transfer in pool_transfers or []:
-            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
-            )
-            component_keys = self._tag_keys(component_keys)
-            start = len(all_component_keys)
-            all_component_keys.extend(component_keys)
-            prepared.append((transfer, key_multiplier, start, len(all_component_keys)))
-
-        all_exists = self._batch_exist(all_component_keys) if all_component_keys else []
-        for transfer, key_multiplier, start, end in prepared:
+        transfers = list(pool_transfers or [])
+        all_page_exists = self._pools_page_exists(keys, transfers, kv_pages)
+        for transfer, page_exists in zip(transfers, all_page_exists):
             if not restorable:
                 break
-            ex = all_exists[start:end]
-            if key_multiplier > 0:
-                page_exists = [
-                    all(
-                        r == 1
-                        for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
-                    )
-                    for i in range(kv_pages)
-                ]
-            else:
-                page_exists = [False] * kv_pages
             boundary = 0
             pool_restorable = []
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
@@ -1118,10 +1135,94 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if boundary:
                 hit_count[transfer.name] = boundary
             pool_restorable_set = set(pool_restorable)
+            pool_final_before = restorable[-1]
             restorable = [p for p in restorable if p in pool_restorable_set]
+            if (restorable[-1] if restorable else 0) < pool_final_before:
+                self._record_hit_limited(str(transfer.name))
 
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
+
+    def _object_layout(
+        self,
+        page_keys: List[str],
+        transfer: PoolTransfer,
+        host_indices: Optional[torch.Tensor] = None,
+    ) -> _ObjectLayout:
+        """Expand logical pages into Mooncake objects for one pool.
+
+        Object keys and buffer pointers must stay zipped one-to-one; without
+        ``host_indices`` only the keys are built (existence queries).
+        """
+        component_keys, objects_per_page = self._get_hybrid_page_component_keys(
+            page_keys, transfer
+        )
+        keys = self._tag_keys(component_keys)
+        merge = self.draft_node_merge if transfer.name == PoolName.DRAFT else None
+        if merge is not None and not merge.is_leader:
+            return _ObjectLayout(
+                keys=keys, objects_per_page=objects_per_page, skip_io=True
+            )
+        if host_indices is None:
+            return _ObjectLayout(keys=keys, objects_per_page=objects_per_page)
+        host_pool = self.registered_pools[transfer.name]
+        if merge is not None:
+            from sglang.srt.mem_cache.hicache_draft_node_merge import (
+                node_page_buffer_meta,
+            )
+
+            ptr_list, size_list = node_page_buffer_meta(host_pool, merge, host_indices)
+        else:
+            ptr_list, size_list = host_pool.get_page_buffer_meta(host_indices)
+        ptr_list, size_list = self._pack_multi_buffer_meta(keys, ptr_list, size_list)
+        return _ObjectLayout(
+            keys=keys,
+            objects_per_page=objects_per_page,
+            buffer_ptrs=ptr_list,
+            buffer_sizes=size_list,
+        )
+
+    def _pools_page_exists(
+        self,
+        page_keys: List[str],
+        transfers: List[PoolTransfer],
+        num_pages: int,
+    ) -> List[List[bool]]:
+        """Per-pool page existence, queried with one Mooncake RPC for all pools."""
+        layouts = [self._object_layout(page_keys, t) for t in transfers]
+        query_keys = []
+        spans = []
+        for transfer, layout in zip(transfers, layouts):
+            start = len(query_keys)
+            if not layout.skip_io and layout.objects_per_page > 0:
+                query_keys.extend(layout.keys)
+                self._record_io(
+                    str(transfer.name),
+                    "exists",
+                    objects=len(layout.keys),
+                    pages=num_pages,
+                )
+            spans.append((start, len(query_keys)))
+
+        all_exists = self._batch_exist(query_keys) if query_keys else []
+        results = []
+        for layout, (start, end) in zip(layouts, spans):
+            if layout.skip_io:
+                # Node-merge follower: the node leader owns this pool's objects.
+                results.append([True] * num_pages)
+                continue
+            per_page = layout.objects_per_page
+            if per_page <= 0:
+                results.append([False] * num_pages)
+                continue
+            ex = all_exists[start:end]
+            results.append(
+                [
+                    all(r == 1 for r in ex[i * per_page : (i + 1) * per_page])
+                    for i in range(num_pages)
+                ]
+            )
+        return results
 
     def _batch_io_v2(
         self,
@@ -1131,6 +1232,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     ):
         # Expand every pool first so one logical operation becomes one Mooncake
         # RPC rather than one RPC per hybrid-cache component.
+        results: dict = {}
         prepared = []
         all_key_strs = []
         all_ptrs = []
@@ -1147,27 +1249,44 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             assert len(keys) > 0
             assert len(keys) == len(host_indices) // page_size
 
-            tagged_keys = self._tag_keys(keys)
-            key_strs, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
-            )
-            key_strs = self._tag_keys(key_strs)
+            # Keys only: buffer metadata is built after the exists query so
+            # stored pages are skipped.
+            layout = self._object_layout(keys, transfer)
+            if layout.skip_io:
+                # Node-merge follower: the node leader does this pool's L3 IO.
+                results[transfer.name] = [True] * len(keys)
+                continue
+            key_strs, key_multiplier = layout.keys, layout.objects_per_page
             start = len(all_key_strs)
             all_key_strs.extend(key_strs)
             buffer_requests.append(
-                (host_pool, host_indices, key_strs, key_multiplier, start)
+                (transfer.name, host_pool, host_indices, key_strs, key_multiplier, start)
             )
             if is_set and self._can_use_group_semantics():
                 all_group_ids.extend(
-                    self._expand_group_ids(tagged_keys, key_multiplier)
+                    self._expand_group_ids(self._tag_keys(keys), key_multiplier)
                 )
-            prepared.append((transfer.name, key_multiplier, start, len(all_key_strs)))
+            prepared.append(
+                (transfer.name, key_multiplier, start, len(all_key_strs), len(keys))
+            )
 
         if not prepared:
-            return {}
+            return results
 
         exist_result = self._batch_exist(all_key_strs) if is_set else None
-        for host_pool, host_indices, key_strs, key_multiplier, start in buffer_requests:
+        if is_set:
+            for name, _, start, end, num_pages in prepared:
+                self._record_io(
+                    str(name), "exists", objects=end - start, pages=num_pages
+                )
+        for (
+            name,
+            host_pool,
+            host_indices,
+            key_strs,
+            key_multiplier,
+            start,
+        ) in buffer_requests:
             pool_ptrs, pool_sizes = self._build_pool_buffer_meta(
                 host_pool=host_pool,
                 host_indices=host_indices,
@@ -1178,6 +1297,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     if exist_result is not None
                     else None
                 ),
+                merge=self.draft_node_merge if name == PoolName.DRAFT else None,
             )
             all_ptrs.extend(pool_ptrs)
             all_sizes.extend(pool_sizes)
@@ -1191,6 +1311,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 for size in all_sizes
             ]
 
+        io_start = time.perf_counter()
         if is_set:
             assert exist_result is not None
             io_results = [0 if state == 1 else -1 for state in exist_result]
@@ -1215,18 +1336,40 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             io_results = self._get_batch_zero_copy_impl(
                 all_key_strs, all_ptrs, all_sizes, pool=None
             )
+        # One RPC serves every pool, so each pool records the shared wall time.
+        io_seconds = time.perf_counter() - io_start
 
-        results: dict = {}
-        for name, key_multiplier, start, end in prepared:
+        for name, key_multiplier, start, end, num_pages in prepared:
+            pool_results = io_results[start:end]
+            if self.enable_storage_metrics:
+                if is_set:
+                    missing = [i for i in range(start, end) if exist_result[i] != 1]
+                    self._record_io(
+                        str(name),
+                        "put",
+                        objects=len(missing),
+                        pages=len({(i - start) // key_multiplier for i in missing}),
+                        nbytes=sum(_object_nbytes(all_sizes[i]) for i in missing),
+                        seconds=io_seconds,
+                    )
+                else:
+                    self._record_io(
+                        str(name),
+                        "get",
+                        objects=end - start,
+                        pages=num_pages,
+                        nbytes=sum(res for res in pool_results if res > 0),
+                        seconds=io_seconds,
+                    )
             if (
                 not is_set
                 and self.enable_diagnostic_metrics
-                and io_results[start:end]
-                and min(io_results[start:end]) <= 0
+                and pool_results
+                and min(pool_results) <= 0
             ):
-                self._record_read_failures(str(name), io_results[start:end])
+                self._record_read_failures(str(name), pool_results)
             results[name] = self._batch_postprocess(
-                io_results[start:end],
+                pool_results,
                 is_set_operate=is_set,
                 key_multiplier=key_multiplier,
             )
@@ -1239,6 +1382,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         key_strs: List[str],
         key_multiplier: int,
         exist_states: Optional[List[int]],
+        merge: Optional[Any] = None,
     ) -> Tuple[List[Any], List[Any]]:
         # Only pages the store is missing need per-layer addresses. Zero
         # placeholders keep result and group offsets aligned for the rest.
@@ -1271,7 +1415,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 ]
 
         selected_keys = [key_strs[i] for i in object_indices]
-        ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+        if merge is not None:
+            # Draft node merge: one object spans every rank's slice of the node.
+            from sglang.srt.mem_cache.hicache_draft_node_merge import (
+                node_page_buffer_meta,
+            )
+
+            ptr_list, element_size_list = node_page_buffer_meta(
+                host_pool, merge, host_indices
+            )
+        else:
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
         if len(ptr_list) != len(selected_keys):
             ptr_list, element_size_list = self._pack_multi_buffer_meta(
                 selected_keys, ptr_list, element_size_list
@@ -1432,6 +1586,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         end_time = time.perf_counter()
 
         if self.enable_storage_metrics:
+            self._record_io(
+                str(PoolName.KV),
+                "get",
+                objects=len(key_strs),
+                pages=len(keys),
+                nbytes=sum(res for res in get_results if res > 0),
+                seconds=end_time - start_time,
+            )
             self.prefetch_pgs.append(len(keys))
             self.prefetch_bandwidth.append(
                 len(keys) / (end_time - start_time) * self.gb_per_page
@@ -1460,6 +1622,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else None
         )
         exist_result = self._batch_exist(key_strs)
+        self._record_io(
+            str(PoolName.KV), "exists", objects=len(key_strs), pages=len(keys)
+        )
 
         set_keys = []
         set_buffer_ptrs = []
@@ -1487,6 +1652,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             end_time = time.perf_counter()
 
             if self.enable_storage_metrics:
+                self._record_io(
+                    str(PoolName.KV),
+                    "put",
+                    objects=len(set_keys),
+                    pages=len({i // key_multiplier for i in set_indices}),
+                    nbytes=sum(_object_nbytes(size) for size in set_buffer_sizes),
+                    seconds=end_time - start_time,
+                )
                 self.backup_pgs.append(len(set_keys))
                 self.backup_bandwidth.append(
                     len(set_keys) / (end_time - start_time) * self.gb_per_page
@@ -1651,6 +1824,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_multiplier = 2
 
         exist_result = self._batch_exist(query_keys)
+        self._record_io(
+            str(PoolName.KV), "exists", objects=len(query_keys), pages=len(keys)
+        )
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier
@@ -1758,4 +1934,74 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         with self._read_failed_keys_lock:
             storage_metrics.read_failed_keys = self._read_failed_keys
             self._read_failed_keys = {}
+        with self._io_stats_lock:
+            storage_metrics.storage_io = self._storage_io
+            storage_metrics.storage_io_durations = self._storage_io_durations
+            storage_metrics.storage_hit_limited = self._storage_hit_limited
+            self._storage_io = {}
+            self._storage_io_durations = []
+            self._storage_hit_limited = {}
+        storage_metrics.host_pool_bytes = dict(self._host_pool_bytes)
         return storage_metrics
+
+    def _record_io(
+        self,
+        pool: str,
+        op: str,
+        *,
+        objects: int,
+        pages: int,
+        nbytes: int = 0,
+        seconds: Optional[float] = None,
+    ) -> None:
+        if not self.enable_storage_metrics or objects == 0:
+            return
+        with self._io_stats_lock:
+            totals = self._storage_io.setdefault((pool, op), [0, 0, 0])
+            totals[0] += objects
+            totals[1] += pages
+            totals[2] += nbytes
+            if seconds is not None and self.enable_diagnostic_metrics:
+                self._storage_io_durations.append((pool, op, seconds))
+
+    def _record_hit_limited(self, pool: str) -> None:
+        if not self.enable_storage_metrics:
+            return
+        with self._io_stats_lock:
+            self._storage_hit_limited[pool] = self._storage_hit_limited.get(pool, 0) + 1
+
+    def _record_host_pool_bytes(self, pool: str, host_pool: HostKVCache) -> None:
+        if not isinstance(host_pool, HostKVCache):
+            return
+        # Lazy: the node-leader module pulls in distributed state.
+        from sglang.srt.mem_cache.mla_host_node_leader import (
+            NodeSharedHostTensorAllocator,
+        )
+
+        nbytes = sum(
+            buffer.nbytes for buffer in self._iter_host_pool_buffers(host_pool)
+        )
+        if nbytes == 0 or host_pool.host_buffer_read_only:
+            # Logical anchors and node-leader followers own no host copy.
+            return
+        # The MLA leader buffer holds the whole node's copy; a draft node-merge
+        # rank holds its slice of one node buffer. Either way, sum over ranks.
+        sharing = (
+            "node"
+            if isinstance(host_pool.allocator, NodeSharedHostTensorAllocator)
+            else "rank"
+        )
+        self._host_pool_bytes[(pool, sharing)] = nbytes
+
+    @staticmethod
+    def _resolve_draft_node_merge(host_pool: Any):
+        if not isinstance(host_pool, HostKVCache):
+            return None
+        # Lazy: the node-leader module pulls in distributed state.
+        from sglang.srt.mem_cache.hicache_draft_node_merge import (
+            DraftNodeShareAllocator,
+        )
+
+        if not isinstance(host_pool.allocator, DraftNodeShareAllocator):
+            return None
+        return host_pool.allocator.merge
