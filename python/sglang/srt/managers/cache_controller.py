@@ -1184,9 +1184,12 @@ class HiCacheController:
                         kv_derived_transfers,
                     )
                 except Exception:
+                    # This rank can only vouch for earlier batches. Continue the
+                    # normal short-read path so every rank issues the same ACKs.
                     logger.exception(
-                        "HiCache prefetch transfer failed for request %s",
+                        "Prefetch KV read failed for request %s at page %d",
                         operation.request_id,
+                        operation.start_page + i,
                     )
                     hit_pages = 0
                 # Check termination
