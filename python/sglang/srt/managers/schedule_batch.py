@@ -3761,8 +3761,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
-        # Decode embeds the last output token via embed_tokens; clear the stale
-        # prefill-time tensors so they don't leak into ForwardBatch.
+        # Decode embeds the last output token. Prompt embeddings and positional
+        # replacements refer to the previous prefill input.
         self.input_embeds = None
         self.replace_embeds = None
         self.replace_positions = None
