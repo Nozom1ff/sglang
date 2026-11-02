@@ -194,6 +194,9 @@ def build_replay_fb_view(
     Subsumes the _replay_forward_batch side channel that DSV4 used to
     read out-of-band before the init_forward_metadata 3-method ABC.
     """
+    # An idle compact verify supplies dummy rows for its peers' graph tier.
+    # None of those rows owns a Mamba state slot.
+    live_bs = 0 if getattr(forward_batch.spec_info, "is_padding_only", False) else raw_bs
     return SimpleNamespace(
         batch_size=bs,
         forward_mode=capture_forward_mode,
@@ -213,7 +216,7 @@ def build_replay_fb_view(
             None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu[:bs]
         ),
         max_seq_len_host=forward_batch.max_seq_len_host,
-        num_padding=bs - raw_bs,
+        num_padding=bs - live_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
@@ -1740,10 +1743,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Glue-graph fast path: pointer-stable prep (static buffers + pool
         # tensors only) is captured per key; guards keep every python-visible
         # branch inside the backends constant for that key.
+        # An idle compact verify's rows are all padding (see build_replay_fb_view).
+        padding_only = getattr(forward_batch.spec_info, "is_padding_only", False)
         glue_route = (
             self._metadata_glue is not None
             and not self._metadata_glue.disabled
             and raw_bs == bs
+            and not padding_only
             and not self.enable_two_batch_overlap
             and not self.enable_pdmux
             and self.model_runner.lora_manager is None
