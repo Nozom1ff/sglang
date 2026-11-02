@@ -633,6 +633,11 @@ class Envs:
     # The deferred commit's staging (hidden, write locations, positions, commit lengths)
     # in one Triton launch instead of four copies and a fill.
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(False)
+    # Allow SGLANG_RAGGED_VERIFY_MODE=compact for a dense DSpark draft under DP
+    # attention (MoE a2a backends, CUDA graphs, PD decode) and under Kimi-K3 DCP.
+    # Every DP rank replays the same verify token tier, agreed through the MLP
+    # sync. cap-accept stays rejected. Off by default until validated.
+    SGLANG_DSPARK_ENABLE_COMPACT_DP_TIER = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
