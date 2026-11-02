@@ -1453,11 +1453,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 and min(pool_results) <= 0
             ):
                 self._record_read_failures(str(name), pool_results)
-            results[name] = self._batch_postprocess(
-                pool_results,
-                is_set_operate=is_set,
-                key_multiplier=key_multiplier,
-            )
+            if is_set:
+                results[name] = self._batch_postprocess(
+                    pool_results,
+                    is_set_operate=True,
+                    key_multiplier=key_multiplier,
+                )
+            else:
+                # A short object leaves part of its buffers untouched, so a page
+                # hits only when every component read exactly its expected bytes.
+                expected = [_object_nbytes(all_sizes[i]) for i in range(start, end)]
+                results[name] = [
+                    pool_results[i : i + key_multiplier]
+                    == expected[i : i + key_multiplier]
+                    for i in range(0, end - start, key_multiplier)
+                ]
         return results
 
     def _put_missing_objects(
@@ -1522,7 +1532,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _get_objects(
         self, layout: _ObjectLayout, *, num_pages: int, pool: str
-    ) -> List[int]:
+    ) -> List[bool]:
+        """Report a page or segment only when every component was filled."""
         start = time.perf_counter()
         io_results = self._get_batch_zero_copy_impl(
             layout.keys, layout.buffer_ptrs, layout.buffer_sizes, pool=pool
@@ -1536,7 +1547,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 nbytes=sum(res for res in io_results if res > 0),
                 seconds=time.perf_counter() - start,
             )
-        return io_results
+        # A successful read of a shorter disk object leaves part of the supplied
+        # buffers untouched. Include any leading scratch buffers in the size.
+        expected = [_object_nbytes(size) for size in layout.buffer_sizes]
+        width = layout.objects_per_page
+        return [
+            io_results[i : i + width] == expected[i : i + width]
+            for i in range(0, len(expected), width)
+        ]
 
     def _build_pool_buffer_meta(
         self,
@@ -1796,12 +1814,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         layout = self._grouped_layout(
             base, base_page=start_page, segments=segments, pool=str(pool_name)
         )
-        io_results = self._get_objects(
-            layout, num_pages=end - start_page, pool=str(pool_name)
-        )
-        ok = self._batch_postprocess(
-            io_results, is_set_operate=False, key_multiplier=base.objects_per_page
-        )
+        ok = self._get_objects(layout, num_pages=end - start_page, pool=str(pool_name))
         results = [False] * num_pages
         for (lo, hi), segment_ok in zip(segments, ok):
             if not segment_ok:
