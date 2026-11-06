@@ -57,6 +57,7 @@ from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     parallel_prompt_encode,
 )
 from sglang.srt.entrypoints.openai.protocol import (
+    AllowedToolChoice,
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageGenericParam,
@@ -780,6 +781,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 and request.tool_choice in ("required", "none")
             ):
                 template_kwargs.setdefault("tool_choice", request.tool_choice)
+            elif (
+                isinstance(request.tool_choice, AllowedToolChoice)
+                and not request.tool_choice.allowed_tools.tools
+            ):
+                # The text-only grammar can still admit malformed tool markers.
+                template_kwargs.setdefault("tool_choice", "none")
+            elif (
+                isinstance(request.tool_choice, AllowedToolChoice)
+                and request.tool_choice.allowed_tools.mode == "required"
+            ):
+                template_kwargs.setdefault("tool_choice", "required")
             if request.response_format is not None:
                 template_kwargs.setdefault(
                     "response_format",
@@ -1143,7 +1155,7 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             return "Tools cannot be empty if tool choice is set to required."
 
-        if request.tool_choice is not None and not isinstance(request.tool_choice, str):
+        if isinstance(request.tool_choice, ToolChoice):
             if not effective_tools:
                 return "Tools cannot be empty if tool choice is set to a specific tool."
             tool_name = request.tool_choice.function.name
@@ -1152,6 +1164,19 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             if not tool_exists:
                 return f"Tool '{tool_name}' not found in tools list."
+
+        if isinstance(request.tool_choice, AllowedToolChoice):
+            if self.tool_call_parser != "kimi_k3":
+                return "allowed_tools requires the Kimi K3 tool parser."
+            allowed_tools = request.tool_choice.allowed_tools
+            declared_names = {
+                tool.function.name
+                for tool in effective_tools
+                if tool.type == "function"
+            }
+            for tool in allowed_tools.tools:
+                if tool.function.name not in declared_names:
+                    return f"allowed_tools references undeclared function {tool.function.name!r}."
 
         if has_message_tools:
             names = [tool.function.name for tool in effective_tools]
@@ -1858,9 +1883,11 @@ class OpenAIServingChat(OpenAIServingBase):
         tools = None
         tool_call_stop = None
         required_parsed_natively = glm_constraint
-        if effective_tools and request.tool_choice != "none":
+        if (
+            effective_tools or isinstance(request.tool_choice, AllowedToolChoice)
+        ) and request.tool_choice != "none":
             request.skip_special_tokens = False
-            if not isinstance(request.tool_choice, str):
+            if isinstance(request.tool_choice, ToolChoice):
                 tools = [
                     item.model_dump()
                     for item in request.tools or []
@@ -3152,7 +3179,7 @@ class OpenAIServingChat(OpenAIServingBase):
         text: str,
         tools: list[Any],
         finish_reason: dict[str, Any],
-        tool_choice: str | ToolChoice | None = None,
+        tool_choice: str | ToolChoice | AllowedToolChoice | None = None,
         history_tool_calls_cnt: int = 0,
         response_parser_prefix: str = "",
         constrained: bool = False,

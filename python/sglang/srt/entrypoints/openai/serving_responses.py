@@ -364,7 +364,22 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
         tool_choice = request.effective_tool_choice()
-        if isinstance(tool_choice, dict) and not any(
+        if isinstance(tool_choice, dict) and tool_choice["type"] == "allowed_tools":
+            if self.tool_call_parser != "kimi_k3":
+                return self.create_error_response(
+                    "allowed_tools requires the Kimi K3 tool parser.",
+                    param="tool_choice",
+                )
+            declared_functions = {
+                tool.name for tool in request.tools if tool.type == "function"
+            }
+            for tool in tool_choice["tools"]:
+                if tool["name"] not in declared_functions:
+                    return self.create_error_response(
+                        f"allowed_tools references undeclared function {tool['name']!r}.",
+                        param="tool_choice",
+                    )
+        elif isinstance(tool_choice, dict) and not any(
             tool.type in ("function", "custom") and tool.name == tool_choice["name"]
             for tool in request.tools or []
         ):
@@ -747,14 +762,18 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         chat_tools = self._response_tools_to_chat_tools(request)
+        tool_choice = request.effective_tool_choice()
+        is_allowed_tools = (
+            isinstance(tool_choice, dict) and tool_choice["type"] == "allowed_tools"
+        )
         chat_request = ChatCompletionRequest(
             model=request.model,
             messages=messages,
             stream=request.stream,
             tools=chat_tools or None,
             tool_choice=(
-                self._chat_tool_choice(request.effective_tool_choice())
-                if chat_tools
+                self._chat_tool_choice(tool_choice)
+                if chat_tools or is_allowed_tools
                 else "none"
             ),
             parallel_tool_calls=(
@@ -1204,7 +1223,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             content = final_output
 
         tool_choice = request.effective_tool_choice()
-        is_required = tool_choice == "required" or isinstance(tool_choice, dict)
+        is_required = tool_choice == "required" or (
+            isinstance(tool_choice, dict) and tool_choice["type"] == "function"
+        )
         calls: list[ToolCallItem] = []
         parsed_via_native = False
         detector_owns_format = False
@@ -1385,7 +1406,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         array, rather than to the configured detector's native framing."""
         tool_choice = request.effective_tool_choice()
         if not chat_tools or not (
-            tool_choice == "required" or isinstance(tool_choice, dict)
+            tool_choice == "required"
+            or (isinstance(tool_choice, dict) and tool_choice["type"] == "function")
         ):
             return False
         if not self.tool_call_parser:
@@ -1400,10 +1422,20 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _chat_tool_choice(tool_choice: Any) -> Any:
-        """Nest an ``effective_tool_choice()`` result the way chat expects:
-        ``{"type":"function","name":X}`` -> ``{...,"function":{"name":X}}``."""
+        """Translate Responses' flat tool references into Chat's nested shape."""
         if not isinstance(tool_choice, dict):
             return tool_choice
+        if tool_choice["type"] == "allowed_tools":
+            return {
+                "type": "allowed_tools",
+                "allowed_tools": {
+                    "mode": tool_choice["mode"],
+                    "tools": [
+                        {"type": "function", "function": {"name": tool["name"]}}
+                        for tool in tool_choice["tools"]
+                    ],
+                },
+            }
         return {"type": "function", "function": {"name": tool_choice["name"]}}
 
     def _response_tools_to_chat_tools(self, request: ResponsesRequest) -> list[Tool]:
