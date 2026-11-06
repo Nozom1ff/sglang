@@ -1,22 +1,25 @@
 """CPU protocol contracts for Page DCP capability and destination registration."""
 
 import asyncio
+import concurrent.futures
 import json
 import struct
 import threading
+import time
 import unittest
-from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 import test_register_to_bootstrap as bootstrap_tests
+from disagg_test_utils import complete_receiver_setup, make_decode_kv_manager
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
+    ParallelInfoState,
 )
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
@@ -94,6 +97,16 @@ class _RouteRequest:
 
     async def json(self):
         return self._data
+
+
+class _InlineExecutor:
+    def submit(self, fn, *args, **kwargs):
+        future = concurrent.futures.Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as e:  # noqa: BLE001 - mirrored onto the future
+            future.set_exception(e)
+        return future
 
 
 class TestBootstrapDcpPageSupport(CustomTestCase):
@@ -201,8 +214,19 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
                         if support_fields:
                             self.assertIs(data["supports_dcp_page"], supported)
 
-    @patch("sglang.srt.disaggregation.common.conn.requests.get")
-    def test_decode_checks_page_support_before_caching_prefill_info(self, mock_get):
+    @staticmethod
+    def _drain_parallel_info(manager, bootstrap_addr):
+        # The topology GET runs on an executor; step until it has landed.
+        for _ in range(1000):
+            state = manager.try_ensure_parallel_info(bootstrap_addr)
+            if state != ParallelInfoState.PENDING:
+                return state
+            time.sleep(0.005)
+        raise AssertionError("topology fetch never completed")
+
+    @patch("sglang.srt.disaggregation.common.conn._get_bootstrap_session")
+    def test_decode_checks_page_support_before_caching_prefill_info(self, mock_session):
+        mock_get = mock_session.return_value.get
         bootstrap_addr = "127.0.0.1:30000"
         prefill_info = {
             "attn_tp_size": 1,
@@ -224,40 +248,58 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
             with self.subTest(
                 decode_layout=decode_layout, support_fields=support_fields
             ):
-                manager = object.__new__(CommonKVManager)
-                manager.prefill_info_table = {}
-                manager.kv_args = SimpleNamespace(page_size=16)
-                manager.kv_cache_dtype_str = "auto"
-                manager.dcp_size = 1
-                manager.dcp_kv_layout = decode_layout
-                manager.attn_tp_size = 1
-                manager.is_mla_backend = True
-                manager.is_hybrid_mla_backend = False
+                manager = make_decode_kv_manager(
+                    self,
+                    kv_args=SimpleNamespace(page_size=16),
+                    kv_cache_dtype_str="auto",
+                    dcp_kv_layout=decode_layout,
+                )
                 manager._resolve_rank_mapping = MagicMock()
-                mock_get.reset_mock()
-                response = MagicMock(status_code=200)
-                response.json.return_value = {**prefill_info, **support_fields}
-                mock_get.return_value = response
+                # The fetch goes through a per-address Session (#39).
+                manager._fetch_parallel_info_payload = MagicMock(
+                    return_value={**prefill_info, **support_fields}
+                )
 
+                # The topology fetch is asynchronous (#39): run it inline and
+                # let the second call consume the finished future.
+                manager._ensure_parallel_info_executor = lambda: _InlineExecutor()
+                manager.try_ensure_parallel_info(bootstrap_addr)
                 if accepted:
-                    self.assertTrue(manager.try_ensure_parallel_info(bootstrap_addr))
+                    self.assertEqual(
+                        self._drain_parallel_info(manager, bootstrap_addr),
+                        ParallelInfoState.READY,
+                    )
                     cached_info = manager.prefill_info_table[bootstrap_addr]
                     self.assertEqual(
                         cached_info.supports_dcp_page,
                         support_fields.get("supports_dcp_page", False),
                     )
-                    self.assertTrue(manager.try_ensure_parallel_info(bootstrap_addr))
+                    self.assertEqual(
+                        manager.try_ensure_parallel_info(bootstrap_addr),
+                        ParallelInfoState.READY,
+                    )
                 else:
                     with self.assertRaisesRegex(
                         RuntimeError, "DCP page transfer support"
                     ):
-                        manager.try_ensure_parallel_info(bootstrap_addr)
+                        self._drain_parallel_info(manager, bootstrap_addr)
                     self.assertEqual(manager.prefill_info_table, {})
                     manager._resolve_rank_mapping.assert_not_called()
 
-                mock_get.assert_called_once()
-                query = parse_qs(urlsplit(mock_get.call_args.args[0]).query)
-                self.assertEqual(query.get("include_dcp_page_support"), ["1"])
+                manager._fetch_parallel_info_payload.assert_called_once_with(
+                    bootstrap_addr
+                )
+
+    def test_route_lookup_requests_page_support(self):
+        session = MagicMock()
+        session.get.return_value = MagicMock(status_code=200, json=lambda: {})
+        with patch(
+            "sglang.srt.disaggregation.common.conn._get_bootstrap_session",
+            return_value=session,
+        ):
+            CommonKVManager._fetch_parallel_info_payload("127.0.0.1:30000")
+        query = parse_qs(urlsplit(session.get.call_args.args[0]).query)
+        self.assertEqual(query.get("include_dcp_page_support"), ["1"])
 
     def test_token_and_page_share_cached_registration_and_room_metadata(self):
         bootstrap_addr = "127.0.0.1:30000"
@@ -266,7 +308,8 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
         self.addCleanup(override.restore)
         for layout in ("token", "page"):
             with self.subTest(layout=layout):
-                manager = SimpleNamespace(
+                manager = make_decode_kv_manager(
+                    self,
                     kv_args=SimpleNamespace(
                         kv_data_ptrs=[4096],
                         aux_data_ptrs=[],
@@ -287,14 +330,10 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
                     enable_staging=False,
                     defer_decode_allocation=False,
                     request_status={},
+                    _ensure_bootstrap_executor=lambda: _InlineExecutor(),
                     local_ip="127.0.0.1",
                     rank_port=30001,
                     get_session_id=lambda: "session",
-                    addr_to_rooms_tracker=defaultdict(set),
-                    update_status=MagicMock(),
-                    connection_pool={},
-                    connection_lock=threading.Lock(),
-                    required_prefill_response_num_table={},
                     prefill_info_table={
                         bootstrap_addr: SimpleNamespace(
                             pp_size=1,
@@ -325,8 +364,9 @@ class TestBootstrapDcpPageSupport(CustomTestCase):
                     for room in (9, 10):
                         receiver = MooncakeKVReceiver(manager, bootstrap_addr, room)
                         receiver.init(0)
-                        manager.update_status.assert_any_call(
-                            room, KVPoll.WaitingForInput
+                        complete_receiver_setup(receiver)
+                        self.assertEqual(
+                            manager.request_status[room], KVPoll.WaitingForInput
                         )
                         receiver.send_metadata(
                             np.array([1], dtype=np.int32), aux_index=0

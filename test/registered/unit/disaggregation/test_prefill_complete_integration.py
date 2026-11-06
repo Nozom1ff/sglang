@@ -117,6 +117,13 @@ class TestAllocationIntegration(CustomTestCase):
         if ip == "prefill":
             mgr._transfer_lifetime = TransferLifetimeTracker()
         mgr._prefill_unique_rank = Mock(return_value=0)
+        mgr.connection_pool = {}
+        mgr.prefill_info_table = {}
+        mgr.enable_deferred_decode_kv_release = False
+        mgr.waiting_timeout = 5
+        mgr._init_decode_handshake_state()
+        self.addCleanup(mgr._bootstrap_executor.shutdown, wait=True)
+        self.addCleanup(mgr._parallel_info_executor.shutdown, wait=True)
         mgr.get_session_id = Mock(return_value="decode-session")
         mgr._send_multipart_locked = lambda endpoint, msg, **kw: self.wire.append(
             (endpoint, msg)
@@ -168,8 +175,11 @@ class TestAllocationIntegration(CustomTestCase):
         receiver._connect_to_bootstrap_server = Mock(
             return_value=(sock, threading.Lock())
         )
-        with patch.object(receiver, "_setup_bootstrap_infos"):
-            receiver.init(0)
+        # A cached connection makes init() finish the handshake inline (#39).
+        self.decode.connection_pool[f"{receiver.bootstrap_addr}_0_0_0"] = [
+            {"rank_ip": "prefill", "rank_port": 1}
+        ]
+        receiver.init(0)
         return receiver
 
     def test_receiver_hides_allocatable_status_until_source_finishes(self):
@@ -267,7 +277,7 @@ class TestAllocationIntegration(CustomTestCase):
                 decode_allocation_policy="early",
             )
         }
-        with patch.object(receiver, "_setup_bootstrap_infos") as setup:
+        with patch.object(receiver, "_resolve_setup_part") as setup:
             CommonKVReceiver.init(receiver, 0)
         self.assertEqual(receiver.conclude_state, KVPoll.Failed)
         self.assertIn("policy mismatch", self.decode.failure_records[1])

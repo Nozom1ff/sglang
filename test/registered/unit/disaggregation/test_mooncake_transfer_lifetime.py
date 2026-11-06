@@ -41,6 +41,7 @@ def _manager():
     mgr._staging_outstanding = defaultdict(int)
     mgr.deferred_bootstrap = None
     mgr.defer_decode_allocation = False
+    mgr.connection_lock = threading.Lock()
     mgr.request_status = {}
     mgr.state_layout_rejections = {}
     mgr.bootstrap_port = 7000
@@ -438,6 +439,9 @@ class TestMooncakeTransferLifetime(CustomTestCase):
         mgr.prefill_response_tracker = {}
         mgr.local_ip = "127.0.0.1"
         mgr.rank_port = 7101
+        mgr._init_decode_handshake_state()
+        self.addCleanup(mgr._bootstrap_executor.shutdown, wait=True)
+        self.addCleanup(mgr._parallel_info_executor.shutdown, wait=True)
         receiver = MooncakeKVReceiver(mgr, "127.0.0.1:7000", 7)
         receiver.bootstrap_infos = [
             {"rank_ip": "127.0.0.1", "rank_port": 8000 + rank} for rank in (0, 1)

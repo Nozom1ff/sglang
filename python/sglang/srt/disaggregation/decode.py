@@ -28,7 +28,7 @@ from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import torch
@@ -44,7 +44,11 @@ from sglang.srt.disaggregation.checksum import (
     page_indices_for_request,
     state_indices_for_request,
 )
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVManager,
+    CommonKVReceiver,
+    ParallelInfoState,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -384,6 +388,14 @@ class DecodeRequest:
         return self.req.priority
 
 
+class _DpRankQuery(NamedTuple):
+    # Epoch of the prefill addr at submit; an eviction since then voids the answer.
+    epoch: int
+    # The exact requests asked about; a later request reusing a room is not covered.
+    decode_reqs: Tuple[DecodeRequest, ...]
+    future: Future
+
+
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
     Store the requests that are preallocating.
@@ -433,14 +445,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
-        # In-flight authoritative room -> DP-rank lookups, consumed below.
-        self._prefill_dp_rank_queries: Dict[
-            str, Tuple[Tuple[int, ...], Future[Dict[str, int]]]
-        ] = {}
+        # At most one in-flight authoritative room -> DP-rank lookup per addr.
+        self._prefill_dp_rank_queries: Dict[str, _DpRankQuery] = {}
         self._ensure_retry_count: Dict[str, int] = {}
-        self._max_ensure_retries: int = 15  # scheduling cycles
+        self._max_ensure_retries: int = 15  # failed topology fetches
         self._ensure_last_attempt_time: Dict[str, float] = {}
-        self._ensure_retry_interval: float = 1.0  # seconds
+        self._ensure_retry_interval: float = 1.0  # seconds, first retry
+        self._ensure_retry_interval_max: float = 4.0  # seconds
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -1178,6 +1189,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
+    def _retry_delay_for(self, bootstrap_addr: str) -> float:
+        """Exponential backoff for the topology fetch, capped at the ceiling."""
+        count = self._ensure_retry_count.get(bootstrap_addr, 0)
+        if count <= 0:
+            return self._ensure_retry_interval
+        return min(
+            self._ensure_retry_interval * (2 ** (count - 1)),
+            self._ensure_retry_interval_max,
+        )
+
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
     ) -> Tuple[Dict[str, List[DecodeRequest]], List[DecodeRequest]]:
@@ -1188,23 +1209,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         now = time.monotonic()
         for bootstrap_addr, reqs in addr_to_reqs.items():
+            # Checked before the pacing gate so a fetch that just landed is used now.
+            if self.kv_manager.has_parallel_info(bootstrap_addr):
+                self._ensure_retry_count.pop(bootstrap_addr, None)
+                self._ensure_last_attempt_time.pop(bootstrap_addr, None)
+                ready[bootstrap_addr] = reqs
+                continue
+
             last_attempt = self._ensure_last_attempt_time.get(bootstrap_addr)
             if last_attempt is not None and (
-                now - last_attempt < self._ensure_retry_interval
+                now - last_attempt < self._retry_delay_for(bootstrap_addr)
             ):
                 remaining.extend(reqs)
                 continue
 
-            self._ensure_last_attempt_time[bootstrap_addr] = now
-
-            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
-                if bootstrap_addr in self._ensure_retry_count:
-                    del self._ensure_retry_count[bootstrap_addr]
-                if bootstrap_addr in self._ensure_last_attempt_time:
-                    del self._ensure_last_attempt_time[bootstrap_addr]
+            state = self.kv_manager.try_ensure_parallel_info(bootstrap_addr)
+            if state == ParallelInfoState.PENDING:
+                # Not a failed try; each receiver's handshake deadline bounds the wait.
+                remaining.extend(reqs)
+                continue
+            if state == ParallelInfoState.READY:
+                self._ensure_retry_count.pop(bootstrap_addr, None)
+                self._ensure_last_attempt_time.pop(bootstrap_addr, None)
                 ready[bootstrap_addr] = reqs
                 continue
 
+            self._ensure_last_attempt_time[bootstrap_addr] = now
             count = self._ensure_retry_count.get(bootstrap_addr, 0) + 1
             self._ensure_retry_count[bootstrap_addr] = count
 
@@ -1222,59 +1252,130 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return ready, remaining
 
-    def prefetch_prefill_dp_rank_queries(self) -> None:
-        """Start DP-rank lookups before their normal consume point."""
-        if not self.pending_reqs:
-            return
+    def _prune_pending_reqs(self) -> None:
+        # A request aborted or cleared elsewhere must not be resolved or queried.
+        self.pending_reqs = [
+            decode_req
+            for decode_req in self.pending_reqs
+            if decode_req.kv_receiver is not None
+            and not isinstance(decode_req.req.finished_reason, FINISH_ABORT)
+        ]
 
-        queries = self._prefill_dp_rank_queries
-
+    def _group_pending_reqs_by_addr(self) -> Dict[str, List[DecodeRequest]]:
         addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
         for decode_req in self.pending_reqs:
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
+        return addr_to_reqs
 
-        for bootstrap_addr in set(queries) - set(addr_to_reqs):
-            _, stale_future = queries.pop(bootstrap_addr)
-            stale_future.cancel()
-
+    def prefetch_prefill_dp_rank_queries(self) -> None:
+        """Start DP-rank lookups before their normal consume point."""
+        self._prune_pending_reqs()
+        addr_to_reqs = self._group_pending_reqs_by_addr()
+        self._drop_stale_dp_rank_queries(active_addrs=addr_to_reqs.keys())
         for bootstrap_addr, decode_reqs in addr_to_reqs.items():
-            if bootstrap_addr in queries:
+            if bootstrap_addr in self._prefill_dp_rank_queries:
                 continue
-            if self.kv_manager.prefill_info_table.get(bootstrap_addr) is None:
+            if not self.kv_manager.has_parallel_info(bootstrap_addr):
                 continue
-
-            rooms = tuple(
-                decode_req.req.bootstrap_room
-                for decode_req in decode_reqs
-                if self._resolve_prefill_dp_rank(decode_req.req) is None
+            self._submit_prefill_dp_rank_query(
+                bootstrap_addr=bootstrap_addr,
+                decode_reqs=[
+                    decode_req
+                    for decode_req in decode_reqs
+                    if self._resolve_prefill_dp_rank(decode_req.req) is None
+                ],
             )
-            if not rooms:
-                continue
-
-            future = self.kv_manager._ensure_prefill_recompute_executor().submit(
-                CommonKVReceiver.query_prefill_dp_ranks,
-                bootstrap_addr,
-                list(rooms),
-            )
-            queries[bootstrap_addr] = (rooms, future)
 
     def _cancel_prefill_dp_rank_queries(self) -> None:
-        for _, future in self._prefill_dp_rank_queries.values():
-            future.cancel()
+        for query in self._prefill_dp_rank_queries.values():
+            query.future.cancel()
         self._prefill_dp_rank_queries.clear()
+
+    def _cancel_prefill_dp_rank_query(self, bootstrap_addr: str) -> None:
+        query = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
+        if query is not None:
+            query.future.cancel()
+
+    def _drop_stale_dp_rank_queries(self, *, active_addrs) -> None:
+        for bootstrap_addr in set(self._prefill_dp_rank_queries) - set(active_addrs):
+            self._cancel_prefill_dp_rank_query(bootstrap_addr)
+
+    def _submit_prefill_dp_rank_query(
+        self, *, bootstrap_addr: str, decode_reqs: List[DecodeRequest]
+    ) -> None:
+        """Submit a DP-rank lookup without waiting on the scheduler thread."""
+        if not decode_reqs:
+            return
+        self._prefill_dp_rank_queries[bootstrap_addr] = _DpRankQuery(
+            epoch=self.kv_manager.parallel_info_epoch(bootstrap_addr),
+            decode_reqs=tuple(decode_reqs),
+            future=self.kv_manager.submit_dp_rank_query(
+                bootstrap_addr=bootstrap_addr,
+                bootstrap_rooms=[
+                    decode_req.req.bootstrap_room for decode_req in decode_reqs
+                ],
+            ),
+        )
+
+    def _take_dp_rank_answers(
+        self, bootstrap_addr: str, query: _DpRankQuery
+    ) -> Dict[int, int]:
+        """Answers of a finished lookup, keyed by ``id(decode_req)`` of the asked
+        requests; empty when the prefill was evicted since the lookup started."""
+        if query.epoch != self.kv_manager.parallel_info_epoch(bootstrap_addr):
+            return {}
+        try:
+            room_to_rank = query.future.result()
+        except Exception as e:
+            logger.warning("Prefill DP-rank query failed for %s: %s", bootstrap_addr, e)
+            return {}
+        answers: Dict[int, int] = {}
+        for decode_req in query.decode_reqs:
+            prefill_dp_rank = room_to_rank.get(str(decode_req.req.bootstrap_room))
+            if prefill_dp_rank is not None:
+                answers[id(decode_req)] = int(prefill_dp_rank)
+        return answers
+
+    def _consume_dp_rank_query(
+        self, bootstrap_addr: str, need_query: List[DecodeRequest]
+    ) -> Tuple[List[Tuple[DecodeRequest, int]], List[DecodeRequest]]:
+        """Split ``need_query`` into (resolved, still pending); never waits on the
+        lookup, and keeps at most one lookup in flight for ``bootstrap_addr``."""
+        query = self._prefill_dp_rank_queries.get(bootstrap_addr)
+        if query is not None and not query.future.done():
+            return [], need_query
+
+        answers: Dict[int, int] = {}
+        if query is not None:
+            del self._prefill_dp_rank_queries[bootstrap_addr]
+            answers = self._take_dp_rank_answers(bootstrap_addr, query)
+
+        # Matched by request identity, not room: an answer given for a room
+        # does not cover a later request that reuses it.
+        resolved: List[Tuple[DecodeRequest, int]] = []
+        unresolved: List[DecodeRequest] = []
+        for decode_req in need_query:
+            prefill_dp_rank = answers.get(id(decode_req))
+            if prefill_dp_rank is not None:
+                resolved.append((decode_req, prefill_dp_rank))
+            else:
+                unresolved.append(decode_req)
+
+        # Rooms the prefill has not registered yet are asked again; each
+        # receiver's handshake deadline bounds how long that goes on.
+        self._submit_prefill_dp_rank_query(
+            bootstrap_addr=bootstrap_addr, decode_reqs=unresolved
+        )
+        return resolved, unresolved
 
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""
-        if not self.pending_reqs:
-            self._cancel_prefill_dp_rank_queries()
+        self._prune_pending_reqs()
+        addr_to_reqs = self._group_pending_reqs_by_addr()
+        self._drop_stale_dp_rank_queries(active_addrs=addr_to_reqs.keys())
+        if not addr_to_reqs:
             return
-
-        # Group pending requests by bootstrap_addr
-        addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
-        for decode_req in self.pending_reqs:
-            addr = _bootstrap_addr(decode_req.req)
-            addr_to_reqs.setdefault(addr, []).append(decode_req)
 
         # Pass 1: ensure parallel info for each addr
         ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
@@ -1291,39 +1392,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             # Pass 2: resolve dp rank for addrs whose info is available
             if need_query:
-                rooms = [decode_req.req.bootstrap_room for decode_req in need_query]
-                prefetched = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
-                prefetched_rooms = prefetched[0] if prefetched is not None else ()
-                if (
-                    prefetched is not None
-                    and tuple(rooms[: len(prefetched_rooms)]) == prefetched_rooms
-                ):
-                    room_to_rank = prefetched[1].result()
-                    remaining_rooms = rooms[len(prefetched_rooms) :]
-                    if remaining_rooms:
-                        room_to_rank.update(
-                            CommonKVReceiver.query_prefill_dp_ranks(
-                                bootstrap_addr, remaining_rooms
-                            )
-                        )
-                else:
-                    if prefetched is not None:
-                        prefetched[1].cancel()
-                    room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
-                        bootstrap_addr, rooms
-                    )
-                for decode_req in need_query:
-                    prefill_dp_rank = room_to_rank.get(
-                        str(decode_req.req.bootstrap_room)
-                    )
-                    if prefill_dp_rank is not None:
-                        resolved.append((decode_req, int(prefill_dp_rank)))
-                    else:
-                        remaining.append(decode_req)
+                answered, unanswered = self._consume_dp_rank_query(
+                    bootstrap_addr, need_query
+                )
+                resolved.extend(answered)
+                remaining.extend(unanswered)
             else:
-                prefetched = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
-                if prefetched is not None:
-                    prefetched[1].cancel()
+                self._cancel_prefill_dp_rank_query(bootstrap_addr)
 
         self.pending_reqs = remaining
 
